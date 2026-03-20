@@ -1,0 +1,40 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: predictor
+      POSTGRES_PASSWORD: predictor
+      POSTGRES_DB: predictor
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U predictor"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://predictor:predictor@db:5432/predictor
+      METRICS_SOURCE_URL: http://prometheus:9090
+      MODEL_STORAGE_PATH: /app/models
+      ACCURACY_THRESHOLD: "0.85"
+      RETRAIN_INTERVAL_HOURS: "24"
+      LOG_LEVEL: INFO
+    ports:
+      - "8000:8000"
+    volumes:
+      - model_storage:/app/models
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  model_storage:

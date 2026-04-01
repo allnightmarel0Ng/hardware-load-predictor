@@ -231,14 +231,18 @@ def forecast_cluster(
                 config_id=s.config_id,
                 predicted_cpu_percent=s.predicted_cpu_percent,
                 predicted_ram_gb=s.predicted_ram_gb,
+                predicted_ram_percent=s.predicted_ram_percent,
                 predicted_network_mbps=s.predicted_network_mbps,
+                predicted_disk_io_percent=s.predicted_disk_io_percent,
                 forecast_result_id=s.forecast_result_id,
             )
             for s in result.servers
         ],
         cluster_cpu_avg_percent=result.cluster_cpu_avg_percent,
         cluster_ram_total_gb=result.cluster_ram_total_gb,
+        cluster_ram_avg_percent=result.cluster_ram_avg_percent,
         cluster_network_total_mbps=result.cluster_network_total_mbps,
+        cluster_disk_avg_io_percent=result.cluster_disk_avg_io_percent,
         skipped_servers=result.skipped_servers,
     )
 
@@ -483,12 +487,12 @@ def train(config_id: int, body: TrainRequest, db: Session = Depends(get_db)):
     )
 
     report = correlation_analyzer.analyze(bundle)
-    if not report.any_significant:
+    if report.is_business_constant:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
-                "No significant correlations found between the business metric "
-                "and system metrics. Check your formula or try more data."
+                "The business metric series has near-zero variance — it appears "
+                "constant. Check your PromQL formula or increase the lookback window."
             ),
         )
 

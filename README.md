@@ -4,26 +4,6 @@ Predicts CPU%, RAM (GB), and network (Mbps) load on compute infrastructure
 from business-level metrics (orders/min, active users, requests/sec) using
 machine learning. Supports single-server and multi-server cluster deployments.
 
----
-
-## Module Status
-
-| # | Module | File | Status |
-|---|--------|------|--------|
-| 1 | Configuration Manager | `app/modules/config_manager.py` | ✅ Real |
-| 2 | Historical Data Collector | `app/modules/data_collector.py` | 🟡 Prometheus stub (real HTTP commented in) |
-| 3 | Correlation Analyzer | `app/modules/correlation_analyzer.py` | ✅ Real — Pearson + Spearman CCF, lag sweep 0–60 min |
-| 4 | Model Trainer | `app/modules/model_trainer.py` | ✅ Real — GradientBoostingRegressor + Ridge fallback |
-| 5 | Forecasting Engine | `app/modules/forecasting_engine.py` | ✅ Real — joblib inference, 9-feature vector |
-| 6 | Accuracy Monitor | `app/modules/accuracy_monitor.py` | ✅ Real — Prometheus actuals, MAE/RMSE/R², PSI drift |
-| 7 | Request Handler (API) | `app/modules/request_handler.py` | ✅ Real REST API |
-| + | Job Runner | `app/modules/job_runner.py` | ✅ Real — async ThreadPoolExecutor |
-| + | Drift Detector | `app/modules/drift_detector.py` | ✅ Real — PSI (Population Stability Index) |
-| + | Server Group Manager | `app/modules/server_group_manager.py` | ✅ Real — multi-server CRUD |
-| + | Cluster Forecaster | `app/modules/cluster_forecaster.py` | ✅ Real — aggregate forecast across N servers |
-
----
-
 ## Quickstart
 
 ```bash
@@ -258,16 +238,24 @@ pytest -v
 
 ---
 
-## Connecting Real Prometheus (Module 2)
+## Prometheus Configuration (Module 2)
 
-In `data_collector.py`, the real HTTP call is commented in `_query_prometheus()`.
-Uncomment and set in `.env`:
+Module 2 makes real HTTP calls to the Prometheus range API by default.
+Set in `.env`:
 
 ```env
 METRICS_SOURCE_URL=http://your-prometheus:9090
 ```
 
-Override the default PromQL expressions for system metrics:
+For local development without a Prometheus instance:
+
+```env
+USE_PROMETHEUS_STUB=true
+```
+
+Override the default PromQL expressions for system metrics if your
+node_exporter labels differ:
+
 ```env
 PROMETHEUS_CPU_QUERY=100 - avg(irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100
 PROMETHEUS_RAM_QUERY=(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / 1073741824

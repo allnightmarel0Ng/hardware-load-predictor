@@ -69,28 +69,27 @@ def _build_features(
     """
     Construct feature matrix X and target matrix y from the MetricsBundle.
 
-    Features (per timestep t):
-      - biz[t - lag]              lagged business metric value
-      - biz_roll5_mean            rolling mean over prev 5 points
-      - biz_roll5_std             rolling std over prev 5 points
-      - biz_roll15_mean           rolling mean over prev 15 points
-      - biz_roll15_std            rolling std over prev 15 points
-      - hour_sin, hour_cos        hour-of-day encoded as sine/cosine pair
-      - dow_sin, dow_cos          day-of-week encoded as sine/cosine pair
+    Features (9, per timestep t):
+      - biz[t - lag]           lagged business metric value
+      - biz_roll5_mean/std     rolling mean/std over prev 5 points
+      - biz_roll15_mean/std    rolling mean/std over prev 15 points
+      - hour_sin/cos           hour-of-day (cyclical)
+      - dow_sin/cos            day-of-week (cyclical)
 
-    Targets:
-      - cpu_percent at time t
-      - ram_gb      at time t
-      - net_mbps    at time t
-
-    The lag shift means we need at least `lag` leading points before
-    we can form a valid row — those rows are dropped.
+    Targets (5):
+      - cpu_percent            [0, 100]
+      - ram_gb                 [0, ∞)
+      - ram_percent            [0, 100]
+      - network_mbps           [0, ∞)
+      - disk_io_percent        [0, 100]
     """
-    biz = np.array([p["value"]     for p in bundle.business], dtype=float)
-    cpu = np.array([p["value"]     for p in bundle.cpu],      dtype=float)
-    ram = np.array([p["value"]     for p in bundle.ram],      dtype=float)
-    net = np.array([p["value"]     for p in bundle.network],  dtype=float)
-    ts  = [p["timestamp"] for p in bundle.business]
+    biz         = np.array([p["value"] for p in bundle.business],    dtype=float)
+    cpu         = np.array([p["value"] for p in bundle.cpu],         dtype=float)
+    ram_gb      = np.array([p["value"] for p in bundle.ram_gb],      dtype=float)
+    ram_percent = np.array([p["value"] for p in bundle.ram_percent], dtype=float)
+    net         = np.array([p["value"] for p in bundle.network],     dtype=float)
+    disk        = np.array([p["value"] for p in bundle.disk],        dtype=float)
+    ts          = [p["timestamp"] for p in bundle.business]
 
     n = len(biz)
     start = max(lag, 15)  # need 15 points for the longest rolling window
@@ -108,7 +107,6 @@ def _build_features(
         roll15_mean = float(np.mean(window15)) if len(window15) > 0 else biz[t]
         roll15_std  = float(np.std(window15))  if len(window15) > 1 else 0.0
 
-        # Cyclical encoding of time features
         hour = ts[t].hour + ts[t].minute / 60.0
         dow  = ts[t].weekday()
         hour_sin = np.sin(2 * np.pi * hour / 24.0)
@@ -123,11 +121,15 @@ def _build_features(
             hour_sin, hour_cos,
             dow_sin, dow_cos,
         ])
-        rows_y.append([cpu[t], ram[t], net[t]])
+        rows_y.append([
+            cpu[t],
+            ram_gb[t],
+            ram_percent[t],
+            net[t],
+            disk[t],
+        ])
 
-    X = np.array(rows_X, dtype=float)
-    y = np.array(rows_y, dtype=float)
-    return X, y
+    return np.array(rows_X, dtype=float), np.array(rows_y, dtype=float)
 
 
 # ── Evaluation helpers ───────────────────────────────────────────────────────
@@ -142,10 +144,10 @@ def _mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     """
-    Compute MAE, RMSE, MAPE, R² for each of the three targets
-    (columns: 0=cpu, 1=ram, 2=net) plus an overall MAPE.
+    Compute MAE, RMSE, MAPE, R² for each of the five targets
+    (columns: 0=cpu, 1=ram_gb, 2=ram_pct, 3=net, 4=disk) plus an overall MAPE.
     """
-    names = ["cpu", "ram", "net"]
+    names = ["cpu", "ram_gb", "ram_pct", "net", "disk"]
     metrics: dict = {}
     for i, name in enumerate(names):
         yt = y_true[:, i]
@@ -155,7 +157,6 @@ def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
         metrics[f"mape_{name}"] = round(_mape(yt, yp), 4)
         metrics[f"r2_{name}"]   = round(float(r2_score(yt, yp)), 4)
 
-    # Overall MAPE (flat across all outputs)
     metrics["mape_overall"] = round(
         float(np.mean([metrics[f"mape_{n}"] for n in names])), 4
     )
@@ -319,8 +320,11 @@ def train_model(
     try:
         lag = report.best_lag()
         logger.info(
-            "Training model v%d for config_id=%d  lag=%d min  n_points=%d",
-            version, config.id, lag, report.n_points,
+            "Training model v%d for config_id=%d  lag=%d min  "
+            "significant=%d/5 targets  n_points=%d",
+            version, config.id, lag,
+            sum(1 for r in report.all_results() if r.is_significant),
+            report.n_points,
         )
 
         X, y = _build_features(bundle, lag)
@@ -347,11 +351,12 @@ def train_model(
 
         logger.info(
             "Model v%d ready [%s]  "
-            "MAE cpu=%.2f ram=%.2f net=%.2f  "
-            "R²  cpu=%.3f ram=%.3f net=%.3f",
+            "R² cpu=%.3f ram_gb=%.3f ram_pct=%.3f net=%.3f disk=%.3f  "
+            "MAPE=%.1f%%",
             version, algo_name,
-            metrics["mae_cpu"], metrics["mae_ram"], metrics["mae_net"],
-            metrics["r2_cpu"],  metrics["r2_ram"],  metrics["r2_net"],
+            metrics.get("r2_cpu",    0), metrics.get("r2_ram_gb",  0),
+            metrics.get("r2_ram_pct",0), metrics.get("r2_net",     0),
+            metrics.get("r2_disk",   0), metrics.get("mape_overall", 0),
         )
 
     except Exception:

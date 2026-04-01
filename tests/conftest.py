@@ -11,8 +11,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 # Point to SQLite before importing anything that reads settings
-os.environ["DATABASE_URL"] = "sqlite:///./test.db"
-os.environ["MODEL_STORAGE_PATH"] = "/tmp/test_models"
+os.environ["DATABASE_URL"]        = "sqlite:///./test.db"
+os.environ["MODEL_STORAGE_PATH"]  = "/tmp/test_models"
+os.environ["USE_PROMETHEUS_STUB"] = "true"   # never hit real Prometheus in tests
 
 from app.core.database import Base, get_db
 from app.main import app

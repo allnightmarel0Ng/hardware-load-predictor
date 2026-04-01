@@ -89,10 +89,10 @@ def _run_training_job(job_id: int) -> None:
             lookback_days=job.lookback_days,
         )
         report = analyze(bundle)
-        if not report.any_significant:
+        if report.is_business_constant:
             raise ValueError(
-                "No significant correlations found between business and system metrics. "
-                "Try a longer lookback window or check your PromQL formula."
+                "Business metric series has near-zero variance — appears constant. "
+                "Check the PromQL formula or increase the lookback window."
             )
         model = train_model(db, config, bundle, report)
 

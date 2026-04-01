@@ -35,42 +35,42 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ServerForecast:
     """Prediction for a single server."""
-    server_id: int
-    server_name: str
-    host: str
-    config_id: int
-    predicted_cpu_percent: float
-    predicted_ram_gb: float
-    predicted_network_mbps: float
-    forecast_result_id: int
+    server_id:                int
+    server_name:              str
+    host:                     str
+    config_id:                int
+    predicted_cpu_percent:    float
+    predicted_ram_gb:         float
+    predicted_ram_percent:    float
+    predicted_network_mbps:   float
+    predicted_disk_io_percent: float
+    forecast_result_id:       int
 
 
 @dataclass
 class ClusterForecast:
     """Aggregated cluster-level prediction across all active servers."""
-    group_id: int
-    group_name: str
+    group_id:              int
+    group_name:            str
     business_metric_value: float
-    n_servers: int
-    servers: list[ServerForecast]
+    n_servers:             int
+    servers:               list[ServerForecast]
     # Aggregates
-    cluster_cpu_avg_percent: float     = field(default=0.0)
-    cluster_ram_total_gb: float        = field(default=0.0)
-    cluster_network_total_mbps: float  = field(default=0.0)
-    # Servers whose models are not ready (skipped)
-    skipped_servers: list[str]         = field(default_factory=list)
+    cluster_cpu_avg_percent:     float = field(default=0.0)
+    cluster_ram_total_gb:        float = field(default=0.0)
+    cluster_ram_avg_percent:     float = field(default=0.0)
+    cluster_network_total_mbps:  float = field(default=0.0)
+    cluster_disk_avg_io_percent: float = field(default=0.0)
+    skipped_servers:             list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.servers:
-            self.cluster_cpu_avg_percent    = round(
-                sum(s.predicted_cpu_percent  for s in self.servers) / len(self.servers), 2
-            )
-            self.cluster_ram_total_gb       = round(
-                sum(s.predicted_ram_gb       for s in self.servers), 2
-            )
-            self.cluster_network_total_mbps = round(
-                sum(s.predicted_network_mbps for s in self.servers), 2
-            )
+            n = len(self.servers)
+            self.cluster_cpu_avg_percent     = round(sum(s.predicted_cpu_percent     for s in self.servers) / n,  2)
+            self.cluster_ram_total_gb        = round(sum(s.predicted_ram_gb          for s in self.servers),      2)
+            self.cluster_ram_avg_percent     = round(sum(s.predicted_ram_percent     for s in self.servers) / n,  2)
+            self.cluster_network_total_mbps  = round(sum(s.predicted_network_mbps    for s in self.servers),      2)
+            self.cluster_disk_avg_io_percent = round(sum(s.predicted_disk_io_percent for s in self.servers) / n,  2)
 
 
 def forecast_cluster(
@@ -137,7 +137,9 @@ def forecast_cluster(
                 config_id=config.id,
                 predicted_cpu_percent=result.predicted_cpu_percent,
                 predicted_ram_gb=result.predicted_ram_gb,
+                predicted_ram_percent=result.predicted_ram_percent,
                 predicted_network_mbps=result.predicted_network_mbps,
+                predicted_disk_io_percent=result.predicted_disk_io_percent,
                 forecast_result_id=result.id,
             ))
         except ValueError as exc:
@@ -158,11 +160,14 @@ def forecast_cluster(
     )
 
     logger.info(
-        "Cluster forecast complete: %d/%d servers  "
-        "avg_cpu=%.1f%%  total_ram=%.1f GB  total_net=%.1f Mbps",
+        "Cluster forecast: %d/%d servers  "
+        "avg_cpu=%.1f%%  total_ram=%.1f GB  avg_ram=%.1f%%  "
+        "total_net=%.1f Mbps  avg_disk=%.1f%%",
         len(server_results), len(active_servers),
         cluster.cluster_cpu_avg_percent,
         cluster.cluster_ram_total_gb,
+        cluster.cluster_ram_avg_percent,
         cluster.cluster_network_total_mbps,
+        cluster.cluster_disk_avg_io_percent,
     )
     return cluster

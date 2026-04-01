@@ -57,9 +57,11 @@ MIN_EVAL_SAMPLES: int = 5
 # ── Prometheus queries ────────────────────────────────────────────────────────
 
 class ActualValues(NamedTuple):
-    cpu_percent: float
-    ram_gb: float
-    network_mbps: float
+    cpu_percent:      float
+    ram_gb:           float
+    ram_percent:      float
+    network_mbps:     float
+    disk_io_percent:  float
 
 
 def _fetch_actuals_from_prometheus(
@@ -68,37 +70,21 @@ def _fetch_actuals_from_prometheus(
     at_time: datetime,
 ) -> ActualValues | None:
     """
-    Fetch actual cpu/ram/network values from Prometheus at a specific timestamp.
+    Fetch actual system metric values from Prometheus at a specific timestamp
+    using the instant-query API (GET /api/v1/query?query=<expr>&time=<ts>).
 
-    Uses the Prometheus instant query API:
-        GET /api/v1/query?query=<expr>&time=<unix_ts>
-
-    The three PromQL expressions used are the standard node_exporter metrics:
-      - CPU:     100 - avg(irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100
-      - RAM:     (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / 1e9
-      - Network: irate(node_network_receive_bytes_total[5m]) * 8 / 1e6  (Mbps)
-
-    In deployments where these exact metric names differ, override by setting
-    PROMETHEUS_CPU_QUERY / PROMETHEUS_RAM_QUERY / PROMETHEUS_NET_QUERY in .env.
-
-    Returns None if Prometheus is unreachable or returns no data.
+    Fetches five targets: CPU %, RAM GB, RAM %, Network Mbps, Disk IO %.
+    Returns None if Prometheus is unreachable or any metric returns no data.
     """
-    ts = at_time.timestamp()
+    ts       = at_time.timestamp()
     base_url = f"http://{host}:{port}/api/v1/query"
 
     queries = {
-        "cpu": (
-            getattr(settings, "prometheus_cpu_query", None)
-            or '100 - avg(irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100'
-        ),
-        "ram": (
-            getattr(settings, "prometheus_ram_query", None)
-            or "(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / 1073741824"
-        ),
-        "net": (
-            getattr(settings, "prometheus_net_query", None)
-            or "sum(irate(node_network_receive_bytes_total[5m])) * 8 / 1048576"
-        ),
+        "cpu":      settings.prometheus_cpu_query,
+        "ram_gb":   settings.prometheus_ram_gb_query,
+        "ram_pct":  settings.prometheus_ram_pct_query,
+        "net":      settings.prometheus_net_query,
+        "disk":     settings.prometheus_disk_query,
     }
 
     results: dict[str, float] = {}
@@ -110,11 +96,9 @@ def _fetch_actuals_from_prometheus(
                 data = resp.json()
                 result_list = data.get("data", {}).get("result", [])
                 if not result_list:
-                    logger.debug("Prometheus returned no data for %s at %s", key, at_time)
+                    logger.debug("Prometheus: no data for %s at %s", key, at_time)
                     return None
-                # Instant query returns [[timestamp, value]]
-                raw_value = result_list[0]["value"][1]
-                results[key] = float(raw_value)
+                results[key] = float(result_list[0]["value"][1])
     except httpx.HTTPError as exc:
         logger.warning("Prometheus unreachable for actuals fetch: %s", exc)
         return None
@@ -123,9 +107,11 @@ def _fetch_actuals_from_prometheus(
         return None
 
     return ActualValues(
-        cpu_percent=max(0.0, min(100.0, results["cpu"])),
-        ram_gb=max(0.0, results["ram"]),
-        network_mbps=max(0.0, results["net"]),
+        cpu_percent=     max(0.0, min(100.0, results["cpu"])),
+        ram_gb=          max(0.0, results["ram_gb"]),
+        ram_percent=     max(0.0, min(100.0, results["ram_pct"])),
+        network_mbps=    max(0.0, results["net"]),
+        disk_io_percent= max(0.0, min(100.0, results["disk"])),
     )
 
 
@@ -175,10 +161,12 @@ def _backfill_actuals(db: Session, model: TrainedModel) -> list[ForecastResult]:
             # Prometheus unavailable or no data — skip this row, try again later
             continue
 
-        fr.actual_cpu_percent  = actuals.cpu_percent
-        fr.actual_ram_gb       = actuals.ram_gb
-        fr.actual_network_mbps = actuals.network_mbps
-        fr.actuals_fetched_at  = datetime.utcnow()
+        fr.actual_cpu_percent     = actuals.cpu_percent
+        fr.actual_ram_gb          = actuals.ram_gb
+        fr.actual_ram_percent     = actuals.ram_percent
+        fr.actual_network_mbps    = actuals.network_mbps
+        fr.actual_disk_io_percent = actuals.disk_io_percent
+        fr.actuals_fetched_at     = datetime.utcnow()
         filled.append(fr)
 
     if filled:
@@ -200,14 +188,19 @@ def _mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 def _compute_post_deployment_metrics(rows: list[ForecastResult]) -> dict:
     """
     Compute MAE, RMSE, MAPE, R² from a list of ForecastResult rows
-    that have both predicted and actual values populated.
+    that have all five predicted and actual values populated.
     """
-    cpu_pred = np.array([r.predicted_cpu_percent  for r in rows])
-    ram_pred = np.array([r.predicted_ram_gb       for r in rows])
-    net_pred = np.array([r.predicted_network_mbps for r in rows])
-    cpu_true = np.array([r.actual_cpu_percent      for r in rows])
-    ram_true = np.array([r.actual_ram_gb           for r in rows])
+    cpu_pred = np.array([r.predicted_cpu_percent     for r in rows])
+    rgb_pred = np.array([r.predicted_ram_gb           for r in rows])
+    rpt_pred = np.array([r.predicted_ram_percent      for r in rows])
+    net_pred = np.array([r.predicted_network_mbps     for r in rows])
+    dsk_pred = np.array([r.predicted_disk_io_percent  for r in rows])
+
+    cpu_true = np.array([r.actual_cpu_percent     for r in rows])
+    rgb_true = np.array([r.actual_ram_gb           for r in rows])
+    rpt_true = np.array([r.actual_ram_percent      for r in rows])
     net_true = np.array([r.actual_network_mbps     for r in rows])
+    dsk_true = np.array([r.actual_disk_io_percent  for r in rows])
 
     def _mae(t, p):  return float(np.mean(np.abs(t - p)))
     def _rmse(t, p): return float(np.sqrt(np.mean((t - p) ** 2)))
@@ -217,26 +210,33 @@ def _compute_post_deployment_metrics(rows: list[ForecastResult]) -> dict:
         return 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
 
     mape_all = _mape(
-        np.concatenate([cpu_true, ram_true, net_true]),
-        np.concatenate([cpu_pred, ram_pred, net_pred]),
+        np.concatenate([cpu_true, rgb_true, rpt_true, net_true, dsk_true]),
+        np.concatenate([cpu_pred, rgb_pred, rpt_pred, net_pred, dsk_pred]),
     )
 
     return {
-        "mae_cpu":  round(_mae(cpu_true,  cpu_pred),  4),
-        "mae_ram":  round(_mae(ram_true,  ram_pred),  4),
-        "mae_net":  round(_mae(net_true,  net_pred),  4),
-        "rmse_cpu": round(_rmse(cpu_true, cpu_pred),  4),
-        "rmse_ram": round(_rmse(ram_true, ram_pred),  4),
-        "rmse_net": round(_rmse(net_true, net_pred),  4),
-        "r2_cpu":   round(_r2(cpu_true,  cpu_pred),   4),
-        "r2_ram":   round(_r2(ram_true,  ram_pred),   4),
-        "r2_net":   round(_r2(net_true,  net_pred),   4),
+        "mae_cpu":     round(_mae(cpu_true,  cpu_pred),  4),
+        "mae_ram_gb":  round(_mae(rgb_true,  rgb_pred),  4),
+        "mae_ram_pct": round(_mae(rpt_true,  rpt_pred),  4),
+        "mae_net":     round(_mae(net_true,  net_pred),  4),
+        "mae_disk":    round(_mae(dsk_true,  dsk_pred),  4),
+        "rmse_cpu":    round(_rmse(cpu_true, cpu_pred),  4),
+        "rmse_ram_gb": round(_rmse(rgb_true, rgb_pred),  4),
+        "rmse_ram_pct":round(_rmse(rpt_true, rpt_pred),  4),
+        "rmse_net":    round(_rmse(net_true, net_pred),  4),
+        "rmse_disk":   round(_rmse(dsk_true, dsk_pred),  4),
+        "r2_cpu":      round(_r2(cpu_true,   cpu_pred),  4),
+        "r2_ram_gb":   round(_r2(rgb_true,   rgb_pred),  4),
+        "r2_ram_pct":  round(_r2(rpt_true,   rpt_pred),  4),
+        "r2_net":      round(_r2(net_true,   net_pred),  4),
+        "r2_disk":     round(_r2(dsk_true,   dsk_pred),  4),
         "mape_overall": round(mape_all, 4),
     }
 
 
 def _needs_retraining(metrics: dict, threshold: float) -> bool:
-    r2_values = [metrics[k] for k in ("r2_cpu", "r2_ram", "r2_net") if k in metrics]
+    r2_keys = ("r2_cpu", "r2_ram_gb", "r2_ram_pct", "r2_net", "r2_disk")
+    r2_values = [metrics[k] for k in r2_keys if k in metrics]
     if not r2_values:
         return False
     avg_r2 = sum(r2_values) / len(r2_values)
@@ -328,14 +328,13 @@ def _evaluate_model(db: Session, model: TrainedModel) -> ModelEvaluation | None:
     db.refresh(evaluation)
 
     logger.info(
-        "Evaluation for model %d: n=%d  R²(cpu=%.3f ram=%.3f net=%.3f)  "
-        "MAE(cpu=%.2f ram=%.2f net=%.2f)  MAPE=%.1f%%  PSI=%.4f(%s)  retrain=%s",
+        "Evaluation model %d: n=%d  "
+        "R²(cpu=%.3f ram_gb=%.3f ram_pct=%.3f net=%.3f disk=%.3f)  "
+        "MAPE=%.1f%%  PSI=%.4f(%s)  retrain=%s",
         model.id, len(evaluated_rows),
-        metrics["r2_cpu"],  metrics["r2_ram"],  metrics["r2_net"],
-        metrics["mae_cpu"], metrics["mae_ram"], metrics["mae_net"],
-        metrics["mape_overall"],
-        psi_value or 0.0, psi_level,
-        retrain,
+        metrics["r2_cpu"],    metrics["r2_ram_gb"],  metrics["r2_ram_pct"],
+        metrics["r2_net"],    metrics["r2_disk"],
+        metrics["mape_overall"], psi_value or 0.0, psi_level, retrain,
     )
 
     if retrain:
@@ -363,9 +362,9 @@ def _trigger_retrain(db: Session, config_id: int) -> None:
             config.host, config.port, config.business_metric_formula
         )
         report = analyze(bundle)
-        if not report.any_significant:
+        if report.is_business_constant:
             logger.warning(
-                "No significant correlations found for config_id=%d; skipping retrain.",
+                "Business metric appears constant for config_id=%d — skipping retrain.",
                 config_id,
             )
             return

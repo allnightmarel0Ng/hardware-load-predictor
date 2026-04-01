@@ -53,10 +53,12 @@ class TargetPrediction(NamedTuple):
 
 @dataclass
 class InferencePrediction:
-    """Full prediction for all three targets at one timestep."""
-    cpu:     TargetPrediction
-    ram:     TargetPrediction
-    network: TargetPrediction
+    """Full prediction for all five targets at one timestep."""
+    cpu:         TargetPrediction
+    ram_gb:      TargetPrediction
+    ram_percent: TargetPrediction
+    network:     TargetPrediction
+    disk:        TargetPrediction
 
 
 def _load_artifact(model: TrainedModel) -> dict:
@@ -94,8 +96,8 @@ def _run_inference(
     at_time: datetime | None = None,
 ) -> InferencePrediction:
     """
-    Run point + quantile inference for all three targets.
-    CPU clamped [0,100]; RAM/network to [0,inf).
+    Run point + quantile inference for all five targets.
+    Percentages clamped [0,100]; GB/Mbps to [0,∞).
     Intervals enforced: lower <= point <= upper always holds.
     """
     scaler      = artifact["scaler"]
@@ -106,27 +108,44 @@ def _run_inference(
     X        = _build_inference_feature(business_value, at_time)
     X_scaled = scaler.transform(X)
 
-    pt      = model_point.predict(X_scaled)[0]
+    pt = model_point.predict(X_scaled)[0]   # shape: (5,)
+    # col: 0=cpu_pct, 1=ram_gb, 2=ram_pct, 3=net_mbps, 4=disk_pct
     cpu_pt  = round(float(np.clip(pt[0], 0.0, 100.0)), 2)
-    ram_pt  = round(float(max(0.0, pt[1])), 2)
-    net_pt  = round(float(max(0.0, pt[2])), 2)
+    rgb_pt  = round(float(max(0.0, pt[1])), 2)
+    rpt_pt  = round(float(np.clip(pt[2], 0.0, 100.0)), 2)
+    net_pt  = round(float(max(0.0, pt[3])), 2)
+    dsk_pt  = round(float(np.clip(pt[4], 0.0, 100.0)), 2)
 
     if model_lower is not None and model_upper is not None:
         lo = model_lower.predict(X_scaled)[0]
         hi = model_upper.predict(X_scaled)[0]
-        cpu_lo = round(float(np.clip(lo[0], 0.0, cpu_pt)), 2)
-        cpu_hi = round(float(np.clip(hi[0], cpu_pt, 100.0)), 2)
-        ram_lo = round(float(max(0.0, min(lo[1], ram_pt))), 2)
-        ram_hi = round(float(max(ram_pt, hi[1])), 2)
-        net_lo = round(float(max(0.0, min(lo[2], net_pt))), 2)
-        net_hi = round(float(max(net_pt, hi[2])), 2)
+
+        def _bounds_pct(lo_v, pt_v, hi_v):
+            return (
+                round(float(np.clip(lo_v, 0.0, pt_v)), 2),
+                round(float(np.clip(hi_v, pt_v, 100.0)), 2),
+            )
+        def _bounds_abs(lo_v, pt_v, hi_v):
+            return (
+                round(float(max(0.0, min(lo_v, pt_v))), 2),
+                round(float(max(pt_v, hi_v)), 2),
+            )
+
+        cpu_lo, cpu_hi = _bounds_pct(lo[0], cpu_pt, hi[0])
+        rgb_lo, rgb_hi = _bounds_abs(lo[1], rgb_pt, hi[1])
+        rpt_lo, rpt_hi = _bounds_pct(lo[2], rpt_pt, hi[2])
+        net_lo, net_hi = _bounds_abs(lo[3], net_pt, hi[3])
+        dsk_lo, dsk_hi = _bounds_pct(lo[4], dsk_pt, hi[4])
     else:
-        cpu_lo = cpu_hi = ram_lo = ram_hi = net_lo = net_hi = None
+        cpu_lo = cpu_hi = rgb_lo = rgb_hi = None
+        rpt_lo = rpt_hi = net_lo = net_hi = dsk_lo = dsk_hi = None
 
     return InferencePrediction(
-        cpu=TargetPrediction(point=cpu_pt, lower=cpu_lo, upper=cpu_hi),
-        ram=TargetPrediction(point=ram_pt, lower=ram_lo, upper=ram_hi),
-        network=TargetPrediction(point=net_pt, lower=net_lo, upper=net_hi),
+        cpu=         TargetPrediction(point=cpu_pt, lower=cpu_lo, upper=cpu_hi),
+        ram_gb=      TargetPrediction(point=rgb_pt, lower=rgb_lo, upper=rgb_hi),
+        ram_percent= TargetPrediction(point=rpt_pt, lower=rpt_lo, upper=rpt_hi),
+        network=     TargetPrediction(point=net_pt, lower=net_lo, upper=net_hi),
+        disk=        TargetPrediction(point=dsk_pt, lower=dsk_lo, upper=dsk_hi),
     )
 
 
@@ -159,14 +178,20 @@ def forecast(
         model_id=model.id,
         business_metric_value=business_metric_value,
         predicted_cpu_percent=pred.cpu.point,
-        predicted_ram_gb=pred.ram.point,
+        predicted_ram_gb=pred.ram_gb.point,
+        predicted_ram_percent=pred.ram_percent.point,
         predicted_network_mbps=pred.network.point,
+        predicted_disk_io_percent=pred.disk.point,
         lower_cpu_percent=pred.cpu.lower,
-        lower_ram_gb=pred.ram.lower,
+        lower_ram_gb=pred.ram_gb.lower,
+        lower_ram_percent=pred.ram_percent.lower,
         lower_network_mbps=pred.network.lower,
+        lower_disk_io_percent=pred.disk.lower,
         upper_cpu_percent=pred.cpu.upper,
-        upper_ram_gb=pred.ram.upper,
+        upper_ram_gb=pred.ram_gb.upper,
+        upper_ram_percent=pred.ram_percent.upper,
         upper_network_mbps=pred.network.upper,
+        upper_disk_io_percent=pred.disk.upper,
     )
     db.add(result)
     db.commit()
@@ -174,10 +199,11 @@ def forecast(
 
     has_iv = pred.cpu.lower is not None
     logger.info(
-        "Result: cpu=%.1f%%%s  ram=%.2f GB  net=%.1f Mbps",
+        "Result: cpu=%.1f%%%s  ram=%.2fGB(%.1f%%)  net=%.1fMbps  disk=%.1f%%",
         pred.cpu.point,
         f"(±{round((pred.cpu.upper - pred.cpu.lower) / 2, 1)})" if has_iv else "",
-        pred.ram.point, pred.network.point,
+        pred.ram_gb.point, pred.ram_percent.point,
+        pred.network.point, pred.disk.point,
     )
     return result
 
@@ -231,14 +257,20 @@ def forecast_horizon(
             minutes_ahead=minutes_fwd,
             business_metric_value=biz_val,
             predicted_cpu_percent=pred.cpu.point,
-            predicted_ram_gb=pred.ram.point,
+            predicted_ram_gb=pred.ram_gb.point,
+            predicted_ram_percent=pred.ram_percent.point,
             predicted_network_mbps=pred.network.point,
+            predicted_disk_io_percent=pred.disk.point,
             lower_cpu_percent=pred.cpu.lower,
-            lower_ram_gb=pred.ram.lower,
+            lower_ram_gb=pred.ram_gb.lower,
+            lower_ram_percent=pred.ram_percent.lower,
             lower_network_mbps=pred.network.lower,
+            lower_disk_io_percent=pred.disk.lower,
             upper_cpu_percent=pred.cpu.upper,
-            upper_ram_gb=pred.ram.upper,
+            upper_ram_gb=pred.ram_gb.upper,
+            upper_ram_percent=pred.ram_percent.upper,
             upper_network_mbps=pred.network.upper,
+            upper_disk_io_percent=pred.disk.upper,
         )
         results.append(row)
 

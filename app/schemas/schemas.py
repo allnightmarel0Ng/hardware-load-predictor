@@ -70,9 +70,11 @@ class ServerForecastRead(BaseModel):
     server_name: str
     host: str
     config_id: int
-    predicted_cpu_percent: float
-    predicted_ram_gb: float
-    predicted_network_mbps: float
+    predicted_cpu_percent:     float
+    predicted_ram_gb:          float
+    predicted_ram_percent:     float
+    predicted_network_mbps:    float
+    predicted_disk_io_percent: float
     forecast_result_id: int
 
 
@@ -86,9 +88,12 @@ class ClusterForecastResponse(BaseModel):
     business_metric_value: float
     n_servers: int
     servers: list[ServerForecastRead]
-    cluster_cpu_avg_percent: float
-    cluster_ram_total_gb: float
-    cluster_network_total_mbps: float
+    # Cluster-level aggregates
+    cluster_cpu_avg_percent:     float
+    cluster_ram_total_gb:        float
+    cluster_ram_avg_percent:     float
+    cluster_network_total_mbps:  float
+    cluster_disk_avg_io_percent: float
     skipped_servers: list[str]
 
 
@@ -162,17 +167,24 @@ class ForecastResponse(BaseModel):
     config_id: int
     model_id: int
     business_metric_value: float
-    # Point predictions
-    predicted_cpu_percent: float
-    predicted_ram_gb: float
-    predicted_network_mbps: float
-    # 80% prediction interval (None if model trained on < 50 samples)
-    lower_cpu_percent: float | None
-    lower_ram_gb: float | None
-    lower_network_mbps: float | None
-    upper_cpu_percent: float | None
-    upper_ram_gb: float | None
-    upper_network_mbps: float | None
+    # Point predictions (five targets)
+    predicted_cpu_percent:     float
+    predicted_ram_gb:          float
+    predicted_ram_percent:     float
+    predicted_network_mbps:    float
+    predicted_disk_io_percent: float
+    # 80% prediction intervals (None if model trained on < 50 samples)
+    lower_cpu_percent:         float | None
+    lower_ram_gb:              float | None
+    lower_ram_percent:         float | None
+    lower_network_mbps:        float | None
+    lower_disk_io_percent:     float | None
+    upper_cpu_percent:         float | None
+    upper_ram_gb:              float | None
+    upper_ram_percent:         float | None
+    upper_network_mbps:        float | None
+    upper_disk_io_percent:     float | None
+    created_at: datetime
     created_at: datetime
 
 
@@ -243,18 +255,24 @@ class ModelEvaluationRead(BaseModel):
     model_id: int
     config_id: int
     n_samples: int
-    mae_cpu: float | None
-    mae_ram: float | None
-    mae_net: float | None
-    rmse_cpu: float | None
-    rmse_ram: float | None
-    rmse_net: float | None
+    mae_cpu:      float | None
+    mae_ram_gb:   float | None
+    mae_ram_pct:  float | None
+    mae_net:      float | None
+    mae_disk:     float | None
+    rmse_cpu:     float | None
+    rmse_ram_gb:  float | None
+    rmse_ram_pct: float | None
+    rmse_net:     float | None
+    rmse_disk:    float | None
     mape_overall: float | None
-    r2_cpu: float | None
-    r2_ram: float | None
-    r2_net: float | None
-    psi_value: float | None
-    psi_level: str | None
+    r2_cpu:       float | None
+    r2_ram_gb:    float | None
+    r2_ram_pct:   float | None
+    r2_net:       float | None
+    r2_disk:      float | None
+    psi_value:    float | None
+    psi_level:    str | None
     triggered_retrain: bool
     evaluated_at: datetime
 

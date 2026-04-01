@@ -9,8 +9,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
 from app.core.database import Base, engine
-from app.modules.request_handler import config_router, train_router, forecast_router
+from app.modules.request_handler import config_router, train_router, forecast_router, accuracy_router, jobs_router, groups_router
 from app.modules.accuracy_monitor import start_scheduler, stop_scheduler
+from app.modules.job_runner import start_executor, stop_executor
 
 logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -36,19 +37,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(groups_router)
 app.include_router(config_router)
 app.include_router(train_router)
 app.include_router(forecast_router)
+app.include_router(accuracy_router)
+app.include_router(jobs_router)
 
 
 @app.on_event("startup")
 def on_startup() -> None:
+    start_executor()
     start_scheduler()
 
 
 @app.on_event("shutdown")
 def on_shutdown() -> None:
     stop_scheduler()
+    stop_executor()
 
 
 @app.get("/health", tags=["System"])

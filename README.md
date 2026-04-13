@@ -12,11 +12,6 @@ docker compose up --build
 open http://localhost:8000/docs
 ```
 
-Apply database migrations:
-```bash
-alembic upgrade head
-```
-
 ---
 
 ## API Reference

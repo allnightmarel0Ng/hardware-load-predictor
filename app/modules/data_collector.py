@@ -250,16 +250,22 @@ def fetch_historical_data(
     business_formula: str,
     lookback_days: int = 30,
     step_seconds: int = 60,
+    instance_label: str | None = None,
 ) -> MetricsBundle:
     """
     Fetch aligned historical time-series for correlation analysis and training.
 
-    In production (USE_PROMETHEUS_STUB=false, the default) makes four real
-    Prometheus range queries — one for the business metric and three for
-    system metrics (CPU, RAM, network) using the PromQL expressions from
-    settings.  All queries target the same host:port.
+    In production (USE_PROMETHEUS_STUB=false, the default) makes six real
+    Prometheus range queries — one for the business metric and five for
+    system metrics (CPU, RAM GB, RAM %, network, disk) using the PromQL
+    expressions from settings.  All queries target the same host:port.
 
-    In stub mode (USE_PROMETHEUS_STUB=true) all four series are synthetic.
+    If instance_label is provided, the string "INSTANCE_PLACEHOLDER" in
+    each system metric query is replaced with the given label value before
+    the query is sent.  This lets per-server queries filter by the
+    node_exporter instance label (e.g. "gateway" or "auth_service").
+
+    In stub mode (USE_PROMETHEUS_STUB=true) all series are synthetic.
 
     Args:
         host:             Prometheus host (from ForecastingConfig).
@@ -267,9 +273,12 @@ def fetch_historical_data(
         business_formula: PromQL expression for the business metric.
         lookback_days:    History window to fetch.
         step_seconds:     Query resolution (default 60 s = 1-min data points).
+        instance_label:   Value to substitute for INSTANCE_PLACEHOLDER in
+                          system metric queries.  If None, queries are used
+                          as-is (works when there is only one node_exporter).
 
     Returns:
-        MetricsBundle with four aligned Timeseries.
+        MetricsBundle with six aligned Timeseries.
     """
     end   = datetime.utcnow()
     start = end - timedelta(days=lookback_days)
@@ -289,13 +298,24 @@ def fetch_historical_data(
         disk        = _generate_system_stub(15.0,  30.0,  business)
 
     else:
-        # Real path — six separate Prometheus queries
-        business    = _fetch_series(host, port, business_formula,                  start, end, step_seconds)
-        cpu         = _fetch_series(host, port, settings.prometheus_cpu_query,     start, end, step_seconds)
-        ram_gb      = _fetch_series(host, port, settings.prometheus_ram_gb_query,  start, end, step_seconds)
-        ram_percent = _fetch_series(host, port, settings.prometheus_ram_pct_query, start, end, step_seconds)
-        network     = _fetch_series(host, port, settings.prometheus_net_query,     start, end, step_seconds)
-        disk        = _fetch_series(host, port, settings.prometheus_disk_query,    start, end, step_seconds)
+        # Real path — six separate Prometheus queries.
+        # Build the instance filter: exact match if instance_label is given,
+        # otherwise match any non-empty instance label (all node_exporters).
+        if instance_label:
+            instance_filter = f'instance="{instance_label}"'
+        else:
+            instance_filter = 'instance=~".+"'
+
+        def _q(query: str) -> str:
+            """Inject the instance filter into the query template."""
+            return query.format(instance=instance_filter)
+
+        business    = _query_prometheus(host, port, business_formula,                 start, end, step_seconds)
+        cpu         = _query_prometheus(host, port, _q(settings.prometheus_cpu_query),     start, end, step_seconds)
+        ram_gb      = _query_prometheus(host, port, _q(settings.prometheus_ram_gb_query),  start, end, step_seconds)
+        ram_percent = _query_prometheus(host, port, _q(settings.prometheus_ram_pct_query), start, end, step_seconds)
+        network     = _query_prometheus(host, port, _q(settings.prometheus_net_query),     start, end, step_seconds)
+        disk        = _query_prometheus(host, port, _q(settings.prometheus_disk_query),    start, end, step_seconds)
 
         business, cpu, ram_gb, ram_percent, network, disk = _align_series(
             business, cpu, ram_gb, ram_percent, network, disk
@@ -308,3 +328,4 @@ def fetch_historical_data(
     )
     logger.info("Collected %s", bundle)
     return bundle
+

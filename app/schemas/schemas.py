@@ -114,6 +114,11 @@ class ForecastingConfigCreate(BaseModel):
     port: int = Field(default=9090, ge=1, le=65535)
     business_metric_name: str = Field(..., examples=["orders_per_minute"])
     business_metric_formula: str = Field(..., examples=["sum(rate(orders_total[1m]))"])
+    instance_label: str | None = Field(
+        default=None,
+        examples=["gateway"],
+        description="Prometheus instance label. Replaces INSTANCE_PLACEHOLDER in system metric queries.",
+    )
 
 
 class ForecastingConfigUpdate(BaseModel):
@@ -121,6 +126,7 @@ class ForecastingConfigUpdate(BaseModel):
     port: int | None = Field(default=None, ge=1, le=65535)
     business_metric_name: str | None = None
     business_metric_formula: str | None = None
+    instance_label: str | None = None
 
 
 class ForecastingConfigRead(BaseModel):
@@ -132,6 +138,7 @@ class ForecastingConfigRead(BaseModel):
     port: int
     business_metric_name: str
     business_metric_formula: str
+    instance_label: str | None
     created_at: datetime
     updated_at: datetime
 
@@ -309,3 +316,4 @@ class TrainJobRead(BaseModel):
     started_at: datetime | None
     finished_at: datetime | None
     duration_seconds: float | None
+

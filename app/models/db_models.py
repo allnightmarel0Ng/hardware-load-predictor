@@ -39,6 +39,9 @@ class ServerGroup(Base):
     # Business metric — shared across all servers in this group
     business_metric_name: Mapped[str] = mapped_column(String(255), nullable=False)
     business_metric_formula: Mapped[str] = mapped_column(String(1024), nullable=False)
+    # Optional Prometheus instance label to filter per-server system metrics.
+    # If set, replaces INSTANCE_PLACEHOLDER in system metric PromQL queries.
+    instance_label: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Prometheus endpoint for the business metric (may differ from server metrics)
     metrics_host: Mapped[str] = mapped_column(String(255), nullable=False)
     metrics_port: Mapped[int] = mapped_column(nullable=False, default=9090)
@@ -113,6 +116,9 @@ class ForecastingConfig(Base):
     port: Mapped[int] = mapped_column(nullable=False, default=9090)
     business_metric_name: Mapped[str] = mapped_column(String(255), nullable=False)
     business_metric_formula: Mapped[str] = mapped_column(String(1024), nullable=False)
+    # Optional Prometheus instance label to filter per-server system metrics.
+    # If set, replaces INSTANCE_PLACEHOLDER in system metric PromQL queries.
+    instance_label: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
@@ -123,6 +129,12 @@ class ForecastingConfig(Base):
         back_populates="config", cascade="all, delete-orphan"
     )
     forecasts: Mapped[list["ForecastResult"]] = relationship(
+        back_populates="config", cascade="all, delete-orphan"
+    )
+    training_jobs: Mapped[list["TrainingJob"]] = relationship(
+        back_populates="config", cascade="all, delete-orphan"
+    )
+    evaluations: Mapped[list["ModelEvaluation"]] = relationship(
         back_populates="config", cascade="all, delete-orphan"
     )
 
@@ -307,7 +319,7 @@ class ModelEvaluation(Base):
     evaluated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     model: Mapped["TrainedModel"] = relationship()
-    config: Mapped["ForecastingConfig"] = relationship()
+    config: Mapped["ForecastingConfig"] = relationship(back_populates="evaluations")
 
     def __repr__(self) -> str:
         return (
@@ -346,7 +358,7 @@ class TrainingJob(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
-    config: Mapped["ForecastingConfig"] = relationship()
+    config: Mapped["ForecastingConfig"] = relationship(back_populates="training_jobs")
     model: Mapped["TrainedModel | None"] = relationship()
 
     @property
@@ -357,3 +369,4 @@ class TrainingJob(Base):
 
     def __repr__(self) -> str:
         return f"<TrainingJob id={self.id} config_id={self.config_id} status={self.status}>"
+

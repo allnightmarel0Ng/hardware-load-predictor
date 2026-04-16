@@ -2,6 +2,7 @@
 Module 7 — Request Handler
 FastAPI routers that expose the system's REST API.
 """
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -479,11 +480,33 @@ def train(config_id: int, body: TrainRequest, db: Session = Depends(get_db)):
     """
     config = config_manager.get_config(db, config_id)
 
+    # Verify Prometheus is reachable before starting the job
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            resp = client.get(f"http://{config.host}:{config.port}/-/healthy")
+            resp.raise_for_status()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                f"Prometheus at {config.host}:{config.port} is not reachable: {exc}. "
+                "Check the host and port in your config."
+            ),
+        )
+
+    # Use the explicit instance_label from the config for per-server PromQL
+    # filtering. Falls back to server.name for cluster-provisioned configs.
+    instance_label: str | None = (
+        config.instance_label
+        or (config.server.name if config.server else None)
+    )
+
     bundle = data_collector.fetch_historical_data(
         host=config.host,
         port=config.port,
         business_formula=config.business_metric_formula,
         lookback_days=body.lookback_days,
+        instance_label=instance_label,
     )
 
     report = correlation_analyzer.analyze(bundle)

@@ -38,7 +38,7 @@ from app.modules.data_collector import MetricsBundle
 
 logger = logging.getLogger(__name__)
 
-MIN_TRAIN_SAMPLES = 50   # minimum rows for gradient boosting; below → Ridge
+MIN_TRAIN_SAMPLES = 1000   # minimum rows for gradient boosting; below → Ridge
 TEST_SPLIT_RATIO  = 0.20 # last 20% of data used for evaluation
 
 

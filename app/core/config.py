@@ -10,21 +10,26 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # ── Prometheus query expressions for system metrics ───────────────────────
-    # Override these in .env if your node_exporter labels differ.
+    # Queries support an optional {instance} filter that is injected at
+    # runtime based on the config's instance_label field:
+    #   - instance_label set  → instance="<label>"  (exact match)
+    #   - instance_label None → instance=~".+"       (all instances)
+    # You can override these in .env if your node_exporter labels differ,
+    # but do NOT include an instance label selector — it is added automatically.
     prometheus_cpu_query: str = (
-        '100 - avg(irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100'
+        '100 - avg(irate(node_cpu_seconds_total{{mode="idle",{instance}}}[5m])) * 100'
     )
     prometheus_ram_gb_query: str = (
-        "(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / 1073741824"
+        "(node_memory_MemTotal_bytes{{{instance}}} - node_memory_MemAvailable_bytes{{{instance}}}) / 1073741824"
     )
     prometheus_ram_pct_query: str = (
-        "(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100"
+        "(1 - node_memory_MemAvailable_bytes{{{instance}}} / node_memory_MemTotal_bytes{{{instance}}}) * 100"
     )
     prometheus_net_query: str = (
-        "sum(irate(node_network_receive_bytes_total[5m])) * 8 / 1048576"
+        "sum(irate(node_network_receive_bytes_total{{{instance}}}[5m])) * 8 / 1048576"
     )
     prometheus_disk_query: str = (
-        "avg(irate(node_disk_io_time_seconds_total[5m])) * 100"
+        "avg(irate(node_disk_io_time_seconds_total{{{instance}}}[5m])) * 100"
     )
 
     # ── Stub mode ─────────────────────────────────────────────────────────────
@@ -37,3 +42,4 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+

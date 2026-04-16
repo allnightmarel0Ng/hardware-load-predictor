@@ -179,6 +179,7 @@ def provision_group_configs(db: Session, group_id: int) -> list[ForecastingConfi
             port=server.port,
             business_metric_name=group.business_metric_name,
             business_metric_formula=group.business_metric_formula,
+            instance_label=server.name,
         )
         db.add(config)
         created.append(config)
@@ -193,3 +194,4 @@ def provision_group_configs(db: Session, group_id: int) -> list[ForecastingConfi
         )
 
     return created
+

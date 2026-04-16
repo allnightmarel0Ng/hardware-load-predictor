@@ -42,6 +42,11 @@ class ServerGroup(Base):
     # Optional Prometheus instance label to filter per-server system metrics.
     # If set, replaces INSTANCE_PLACEHOLDER in system metric PromQL queries.
     instance_label: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Optional per-target quality metric overrides (JSON).
+    # Keys: cpu, ram_gb, ram_pct, net, disk.
+    # Values: "r2" | "mape" | "rel_mae" | "mae" | "auto" (default).
+    # Example: {"cpu": "r2", "ram_gb": "rel_mae", "net": "r2+mape"}
+    quality_metric_overrides: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # Prometheus endpoint for the business metric (may differ from server metrics)
     metrics_host: Mapped[str] = mapped_column(String(255), nullable=False)
     metrics_port: Mapped[int] = mapped_column(nullable=False, default=9090)
@@ -119,6 +124,11 @@ class ForecastingConfig(Base):
     # Optional Prometheus instance label to filter per-server system metrics.
     # If set, replaces INSTANCE_PLACEHOLDER in system metric PromQL queries.
     instance_label: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Optional per-target quality metric overrides (JSON).
+    # Keys: cpu, ram_gb, ram_pct, net, disk.
+    # Values: "r2" | "mape" | "rel_mae" | "mae" | "auto" (default).
+    # Example: {"cpu": "r2", "ram_gb": "rel_mae", "net": "r2+mape"}
+    quality_metric_overrides: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
@@ -369,4 +379,3 @@ class TrainingJob(Base):
 
     def __repr__(self) -> str:
         return f"<TrainingJob id={self.id} config_id={self.config_id} status={self.status}>"
-

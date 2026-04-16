@@ -328,4 +328,3 @@ def fetch_historical_data(
     )
     logger.info("Collected %s", bundle)
     return bundle
-

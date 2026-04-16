@@ -1,0 +1,12 @@
+app:
+  log_level: INFO
+  model_storage_path: /app/models
+  accuracy_threshold: 0.85
+  retrain_interval_hours: 24
+  use_prometheus_stub: false
+
+database:
+  url: ${DATABASE_URL}
+
+prometheus:
+  url: ${METRICS_SOURCE_URL}

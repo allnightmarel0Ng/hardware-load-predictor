@@ -119,6 +119,17 @@ class ForecastingConfigCreate(BaseModel):
         examples=["gateway"],
         description="Prometheus instance label. Replaces INSTANCE_PLACEHOLDER in system metric queries.",
     )
+    quality_metric_overrides: dict[str, str] | None = Field(
+        default=None,
+        examples=[{"cpu": "r2", "ram_gb": "rel_mae", "net": "r2+mape"}],
+        description=(
+            "Override the primary quality metric per target. "
+            "Keys: cpu | ram_gb | ram_pct | net | disk. "
+            "Values: r2 | mape | rel_mae | mae | r2+mape | auto. "
+            "Default (auto) selects the metric based on the target nature: "
+            "r2 for CPU, rel_mae for RAM, r2+mape for Net/Disk."
+        ),
+    )
 
 
 class ForecastingConfigUpdate(BaseModel):
@@ -127,6 +138,7 @@ class ForecastingConfigUpdate(BaseModel):
     business_metric_name: str | None = None
     business_metric_formula: str | None = None
     instance_label: str | None = None
+    quality_metric_overrides: dict[str, str] | None = None
 
 
 class ForecastingConfigRead(BaseModel):
@@ -139,11 +151,72 @@ class ForecastingConfigRead(BaseModel):
     business_metric_name: str
     business_metric_formula: str
     instance_label: str | None
+    quality_metric_overrides: dict[str, str] | None
     created_at: datetime
     updated_at: datetime
 
 
 # ── Trained Model ─────────────────────────────────────────────────────────────
+
+class TargetQualityInfo(BaseModel):
+    """
+    Quality report for one system metric target.
+
+    The primary quality metric is chosen based on the nature of each metric:
+      CPU         → R²  (dynamic, directly driven by load)
+      RAM GB/PCT  → rel_mae = MAE/mean  (inertial, low variance — R² unreliable)
+      Network     → R² + MAPE combined  (moderately dynamic, often noisy)
+      Disk        → R² + MAPE combined  (inertial, weak business coupling)
+
+    Grades follow universal thresholds (see API docs):
+      CPU:  excellent R²≥0.95 MAPE≤5% | good R²≥0.85 MAPE≤10% | satisfactory R²≥0.70 MAPE≤15%
+      RAM:  excellent relMAE≤0.01 | good ≤0.03 | satisfactory ≤0.05
+      Net:  excellent R²≥0.90 MAPE≤10% | good R²≥0.75 MAPE≤20% | satisfactory R²≥0.50 MAPE≤30%
+      Disk: excellent R²≥0.85 MAPE≤15% | good R²≥0.65 MAPE≤25% | satisfactory R²≥0.40 MAPE≤40%
+    """
+    # ── Correlation info ──────────────────────────────────────────────────────
+    lag_steps:   int   = Field(..., description="Detected lag in steps (from correlation analysis on training split)")
+    lag_minutes: int   = Field(..., description="Detected lag in minutes")
+    r_star:      float = Field(..., description="Best correlation coefficient r* = max(|Pearson|, |Spearman|) at optimal lag")
+    rel_std:     float = Field(..., description="Coefficient of variation (std/mean) — indicates metric variance; <0.05 = nearly constant")
+
+    # ── Adaptive model chosen ─────────────────────────────────────────────────
+    model_type: str = Field(
+        ...,
+        description=(
+            "Algorithm selected based on r* and rel_std: "
+            "xgboost (r*≥0.7) | gbr (r*≥0.5) | ridge (r*≥0.3) | mean_baseline (rel_std<0.05)"
+        )
+    )
+
+    # ── Primary quality metric ────────────────────────────────────────────────
+    quality_metric: str = Field(
+        ...,
+        description=(
+            "Primary evaluation metric chosen for this target's nature: "
+            "r2 (CPU — dynamic) | rel_mae (RAM — inertial, low variance) | "
+            "r2+mape (Net, Disk — moderately dynamic)"
+        )
+    )
+    quality_value: float = Field(
+        ...,
+        description="Value of the primary quality metric on the test split"
+    )
+    grade: str = Field(
+        ...,
+        description="Qualitative grade based on universal thresholds: excellent | good | satisfactory | poor"
+    )
+    quality_reasoning: str = Field(
+        ...,
+        description="Human-readable explanation of why this metric and grade were chosen"
+    )
+
+    # ── All standard metrics (always computed) ────────────────────────────────
+    r2:      float | None = Field(None, description="R² on test split (None for mean_baseline)")
+    mae:     float | None = Field(None, description="MAE on test split")
+    mape:    float | None = Field(None, description="MAPE % on test split")
+    rel_mae: float | None = Field(None, description="Relative MAE = MAE/mean (most meaningful for RAM)")
+
 
 class TrainedModelRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -157,6 +230,15 @@ class TrainedModelRead(BaseModel):
     lag_minutes: int | None
     trained_at: datetime | None
     created_at: datetime
+    # Per-target quality report (populated from parameters when available)
+    per_target: dict[str, TargetQualityInfo] | None = Field(
+        None,
+        description=(
+            "Per-target quality report. Keys: cpu, ram_gb, ram_pct, net, disk. "
+            "Includes detected lag, correlation strength, chosen algorithm, "
+            "primary quality metric and its grade."
+        )
+    )
 
 
 # ── Forecast (single-step with prediction intervals) ──────────────────────────
@@ -316,4 +398,3 @@ class TrainJobRead(BaseModel):
     started_at: datetime | None
     finished_at: datetime | None
     duration_seconds: float | None
-

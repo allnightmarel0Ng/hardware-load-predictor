@@ -34,3 +34,16 @@ services:
 volumes:
   postgres_data:
   model_storage:
+
+  dashboard:
+    build: .
+    command: streamlit run dashboard.py --server.port=8501 --server.address=0.0.0.0
+    depends_on:
+      - app
+    env_file:
+      - .env
+    environment:
+      API_URL: http://app:8000
+    ports:
+      - "8501:8501"
+    restart: unless-stopped

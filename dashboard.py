@@ -19,6 +19,7 @@ from plotly.subplots import make_subplots
 
 st.set_page_config(
     page_title="Hardware Load Predictor",
+    page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -48,7 +49,7 @@ METRIC_LABELS = {
 # ── Sidebar — connection ──────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.title("Load Predictor")
+    st.title("⚡ Load Predictor")
     st.markdown("---")
     api_url = st.text_input(
         "Predictor API URL",
@@ -61,7 +62,7 @@ with st.sidebar:
         help="Used to display live metric graphs",
     )
     auto_refresh = st.toggle("Auto-refresh (30s)", value=False)
-    if st.button("Refresh now", use_container_width=True):
+    if st.button("🔄 Refresh now", use_container_width=True):
         st.rerun()
     st.markdown("---")
     st.caption("Hardware Load Predictor v2")
@@ -150,19 +151,19 @@ if auto_refresh:
 # ── Connection check ──────────────────────────────────────────────────────────
 
 if not api_reachable():
-    st.error(f"Cannot reach predictor at **{BASE}**. Is it running?")
+    st.error(f"⚠️  Cannot reach predictor at **{BASE}**. Is it running?")
     st.code("docker compose up  # or  uvicorn app.main:app --port 8000")
     st.stop()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
 tab_overview, tab_groups, tab_forecast, tab_metrics, tab_jobs, tab_accuracy = st.tabs([
-    "Overview",
-    "Server Groups",
-    "Forecast",
-    "Live Metrics",
-    "Training Jobs",
-    "Accuracy",
+    "📊 Overview",
+    "🖥️ Server Groups",
+    "🔮 Forecast",
+    "📈 Live Metrics",
+    "⚙️ Training Jobs",
+    "🎯 Accuracy",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -233,7 +234,7 @@ with tab_groups:
     st.header("Server Groups")
 
     # ── Create group ──────────────────────────────────────────────────────────
-    with st.expander("Create new group", expanded=False):
+    with st.expander("➕ Create new group", expanded=False):
         with st.form("create_group"):
             g_name   = st.text_input("Group name", placeholder="cinema-backend")
             g_desc   = st.text_input("Description (optional)")
@@ -280,7 +281,7 @@ with tab_groups:
             servers = g.get("servers", [])
             if servers:
                 for s in servers:
-                    badge = "OK" if s["is_active"] else "FAIL"
+                    badge = "🟢" if s["is_active"] else "🔴"
                     st.markdown(f"{badge} **{s['name']}** — `{s['host']}:{s['port']}`")
             else:
                 st.caption("No servers yet.")

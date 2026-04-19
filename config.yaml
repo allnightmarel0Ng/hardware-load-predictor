@@ -1,9 +1,13 @@
+# hardware-load-predictor configuration
+# Secrets are interpolated from environment variables using ${VAR} syntax.
+
 app:
   log_level: INFO
   model_storage_path: /app/models
   accuracy_threshold: 0.85
   retrain_interval_hours: 24
   use_prometheus_stub: false
+  step_seconds: 300       # Prometheus query resolution in seconds (300 = 5 min, smooths high-freq noise)
 
 database:
   url: ${DATABASE_URL}

@@ -43,17 +43,27 @@ from app.models.db_models import (
     ForecastResult,
     TrainedModel,
 )
-from app.modules.model_trainer import (
-    LOOKBACK,
-    _build_features_for_target,
-    _target_extra_features,
-    get_latest_ready_model,
-)
+# Imported lazily inside functions to avoid circular import with model_trainer
+# (request_handler imports both modules at module level)
 
 logger = logging.getLogger(__name__)
 
-AR_WINDOW  = LOOKBACK + 5
+# Mirror constants from model_trainer — kept in sync manually
+LOOKBACK    = 30
+AR_WINDOW   = LOOKBACK + 5
 TARGET_KEYS = ["cpu", "ram_gb", "ram_pct", "net", "disk"]
+
+
+def _get_latest_ready_model(db, config_id):
+    """Lazy import wrapper to avoid circular dependency."""
+    from app.modules.model_trainer import get_latest_ready_model
+    return get_latest_ready_model(db, config_id)
+
+
+def _get_get_target_extra_features(target_key, hist):
+    """Lazy import wrapper to avoid circular dependency."""
+    from app.modules.model_trainer import _target_extra_features
+    return _get_target_extra_features(target_key, hist)
 
 
 class TargetPrediction(NamedTuple):
@@ -144,8 +154,13 @@ def _build_inference_row(
     target_key: str,
     tau: int,
     at_time: datetime | None = None,
+    max_biz_train: float | None = None,
 ) -> np.ndarray:
-    """Build exactly one feature row (same logic as _build_features_for_target)."""
+    """Build exactly one feature row (same logic as _build_features_for_target).
+
+    max_biz_train: stored in the model artifact at training time.
+        Used to compute biz_above_max — the extrapolation signal.
+    """
     t   = at_time or datetime.utcnow()
     i   = len(biz_hist) - 1
     n   = len(biz_hist)
@@ -166,9 +181,13 @@ def _build_inference_row(
     mu5b = biz_hist[max(0, i-5):i].mean() if i > 0 else bl
     bz   = (biz_hist[i] - mu5b) / (biz_hist[max(0, i-5):i].std() + 1e-9) if i > 0 else 0.0
 
+    biz_above_max = max(0.0, bl - max_biz_train) if max_biz_train is not None else 0.0
+    biz_relative  = bl / (max_biz_train + 1e-9)  if max_biz_train is not None else 1.0
+
     feats: list[float] = [
         sin_h, cos_h, sin_d, cos_d, trend,
         bl, bn, d1, d2, bz, bl * sin_h, bl * cos_h,
+        biz_above_max, biz_relative,
     ]
 
     for key in ("cpu", "ram_pct", "net", "disk"):
@@ -186,7 +205,7 @@ def _build_inference_row(
     # Use sys_ctx for the target's own history (ram_gb not in ctx → use ram_pct proxy)
     ctx_key = "ram_pct" if target_key == "ram_gb" else target_key
     hist = sys_ctx.get(ctx_key, np.zeros(AR_WINDOW))
-    feats.extend(_target_extra_features(target_key, hist))
+    feats.extend(_get_target_extra_features(target_key, hist))
 
     return np.array([feats], dtype=float)
 
@@ -204,12 +223,16 @@ def _infer_one_target(
     if info["model_type"] == "mean_baseline" or info["model"] is None:
         return float(info["mean_val"])
 
-    tau    = info["lag"]
-    scaler = info["scaler"]
-    model  = info["model"]
+    tau           = info["lag"]
+    scaler        = info["scaler"]
+    model         = info["model"]
+    max_biz_train = info.get("max_biz_train")
 
-    X_row  = _build_inference_row(biz_hist, sys_ctx, target_key, tau, at_time)
-    X_sc   = scaler.transform(X_row)
+    X_row = _build_inference_row(biz_hist, sys_ctx, target_key, tau, at_time,
+                                  max_biz_train=max_biz_train)
+
+    X_sc = scaler.transform(X_row) if scaler is not None else X_row
+
     return float(model.predict(X_sc)[0])
 
 
@@ -271,7 +294,7 @@ def forecast(
     config: ForecastingConfig,
     business_metric_value: float,
 ) -> ForecastResult:
-    model_rec = get_latest_ready_model(db, config.id)
+    model_rec = _get_latest_ready_model(db, config.id)
     if model_rec is None:
         raise ValueError(
             f"No ready model for config '{config.name}' (id={config.id}). "
@@ -328,7 +351,7 @@ def forecast_horizon(
     if not steps:
         raise ValueError("steps list must not be empty.")
 
-    model_rec = get_latest_ready_model(db, config.id)
+    model_rec = _get_latest_ready_model(db, config.id)
     if model_rec is None:
         raise ValueError(f"No ready model for config '{config.name}'.")
 

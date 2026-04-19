@@ -6,6 +6,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.modules import (
     config_manager,
@@ -738,9 +739,10 @@ def train(config_id: int, body: TrainRequest, db: Session = Depends(get_db)):
         business_formula=config.business_metric_formula,
         lookback_days=body.lookback_days,
         instance_label=instance_label,
+        step_seconds=settings.step_seconds,
     )
 
-    report = correlation_analyzer.analyze(bundle)
+    report = correlation_analyzer.analyze(bundle, base_step_seconds=settings.step_seconds)
     if report.is_business_constant:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

@@ -4,7 +4,7 @@ import argparse
 import math
 import sys
 from pathlib import Path
-from typing import Dict, Tuple, Callable, List
+from typing import Dict, Tuple, Callable, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -30,7 +30,7 @@ STEP_SECONDS = 300
 TRUE_LAG = 1
 SIGNIFICANCE = 0.6
 LOOKBACK = 30
-TRAIN_RATIO = 0.8
+TRAIN_RATIO = 0.8          # для временного разделения при поиске лагов
 MAX_LAG = 20
 REL_STD_THRESHOLD = 0.05
 
@@ -136,12 +136,32 @@ def pattern_multimodal(cpu: np.ndarray, lag: int) -> np.ndarray:
     scale = 1.0 - 0.7 * weekend_mask
     return np.clip(base * scale + RNG.normal(0, 1, n), 0.5, 300)
 
+def pattern_long_spiky(cpu: np.ndarray, lag: int) -> np.ndarray:
+    """
+    Паттерн: долгий простой (почти нулевая активность), затем резкий скачок
+    и длительное удержание на высоком уровне.
+    """
+    n = len(cpu)
+    base = _cpu_to_proxy(cpu, lag, coeff=0.8)
+    # Порог: первые 70% времени – низкие значения, затем 30% – высокие
+    split = int(0.7 * n)
+    # Низкий уровень: 5-й перцентиль от base
+    low_val = np.percentile(base, 5)
+    # Высокий уровень: 90-й перцентиль
+    high_val = np.percentile(base, 90)
+    result = np.where(np.arange(n) < split, low_val, high_val)
+    # Добавляем небольшой шум, чтобы не было идеально гладко
+    noise = RNG.normal(0, 1.0, n)
+    result = result + noise
+    return np.clip(result, 0.5, 300)
+
 PATTERNS: Dict[str, Tuple[str, Callable]] = {
     "sinusoidal": ("Sinusoidal (SaaS daily wave)", pattern_sinusoidal),
     "step":       ("Step function (batch / ETL)",   pattern_step),
     "spiky":      ("Spiky bursts (event-driven)",   pattern_spiky),
     "drifting":   ("Drifting trend (growing audience)", pattern_drifting),
     "multimodal": ("Multimodal (weekday/weekend split)", pattern_multimodal),
+    "long_spiky": ("Long spikes (long idle + burst hours)", pattern_long_spiky),
 }
 
 def _pearson(a: np.ndarray, b: np.ndarray) -> float:
@@ -181,8 +201,10 @@ def find_lag_and_corr(biz: np.ndarray, sys: np.ndarray, max_lag: int = MAX_LAG) 
     r = max(abs(p), abs(s))
     return best_lag, r
 
-def build_features_full(biz: np.ndarray, ds: Dict[str, np.ndarray], tau: int) -> np.ndarray:
-    """Всегда используем полные бизнес-признаки (сдвиг, нормализация, разности, z-score, взаимодействия)."""
+def build_features_full(biz: np.ndarray, ds: Dict[str, np.ndarray], tau: int,
+                        max_biz_train: Optional[float] = None) -> np.ndarray:
+    """Всегда используем полные бизнес-признаки (сдвиг, нормализация, разности, z-score, взаимодействия).
+       Если задан max_biz_train, добавляется признак biz_above_max = max(0, biz[i] - max_biz_train)."""
     n = ds["n"]
     rows = []
     for i in range(LOOKBACK, n - 1):
@@ -203,6 +225,11 @@ def build_features_full(biz: np.ndarray, ds: Dict[str, np.ndarray], tau: int) ->
         bz = (biz[i] - mu5) / (biz[max(0, i-5):i].std() + 1e-9)
         biz_feats = [bl, bn, d1, d2, bz, bl * sin_h, bl * cos_h]
 
+        # Добавляем признак превышения максимального значения бизнес-метрики в обучении
+        if max_biz_train is not None:
+            biz_above = max(0, biz[i] - max_biz_train)
+            biz_feats.append(biz_above)
+
         sys_feats = []
         for key in ("cpu", "ram_pct", "net", "disk"):
             arr = ds[key]
@@ -222,40 +249,25 @@ def build_features_full(biz: np.ndarray, ds: Dict[str, np.ndarray], tau: int) ->
     X = StandardScaler().fit_transform(np.array(rows))
     return X
 
-def select_model_and_metric(r: float, rel_std: float) -> Tuple[str, str, float, List]:
+def select_model_and_metric(r: float, rel_std: float, extrapolate: bool = False) -> Tuple[str, str, Optional[float], List]:
     """
     Возвращает: (model_type, eval_metric, success_threshold, param_grid)
-    model_type: 'mean_baseline', 'ridge', 'gbm', 'xgboost'
-    eval_metric: 'rel_mae', 'mae', 'r2'
-    success_threshold: порог для PASS/FAIL (None если не оцениваем)
-    param_grid: список словарей для гиперпараметров
+    Для экстраполяционного режима (extrapolate=True) меняем логику для low variance:
+      - даже при rel_std < REL_STD_THRESHOLD используем ridge вместо mean_baseline.
     """
-    if rel_std < REL_STD_THRESHOLD:
+    if not extrapolate and rel_std < REL_STD_THRESHOLD:
         return 'mean_baseline', 'rel_mae', 0.05, [{}]
 
     if r < CORR_LOW:
-        # Ridge, метрика MAE (порог не задаём)
         return 'ridge', 'mae', None, [{'alpha': 0.1}, {'alpha': 1.0}, {'alpha': 10.0}]
     elif r < CORR_MEDIUM:
-        # Ridge, метрика R² (порог 0.70)
         return 'ridge', 'r2', 0.70, [{'alpha': 0.1}, {'alpha': 1.0}, {'alpha': 10.0}]
     elif r < CORR_HIGH:
-        # GBM (depth 4), метрика R² (порог 0.85)
-        if HAS_XGB:
-            # можно и XGBoost использовать, но для средних r лучше GBM
-            return 'gbm', 'r2', 0.85, [{'n_estimators': 300, 'max_depth': 4, 'learning_rate': 0.05}]
-        else:
-            return 'gbm', 'r2', 0.85, [{'n_estimators': 300, 'max_depth': 4, 'learning_rate': 0.05}]
+        return 'gbm', 'r2', 0.85, [{'n_estimators': 300, 'max_depth': 4, 'learning_rate': 0.05}]
     else:
-        # XGBoost (depth 6), метрика R² (порог 0.85)
-        if HAS_XGB:
-            return 'xgboost', 'r2', 0.85, [{'n_estimators': 500, 'max_depth': 6, 'learning_rate': 0.03}]
-        else:
-            # fallback на GBM с глубиной 6
-            return 'gbm', 'r2', 0.85, [{'n_estimators': 500, 'max_depth': 6, 'learning_rate': 0.03}]
+        return 'xgboost', 'r2', 0.85, [{'n_estimators': 500, 'max_depth': 6, 'learning_rate': 0.03}]
 
 def train_model(X, y, model_type, param_grid):
-    """Обучает модель с временным CV, возвращает предсказания на тесте (последние 20%)."""
     n = len(X)
     test_size = int(0.2 * n)
     X_tv, X_test = X[:n - test_size], X[n - test_size:]
@@ -265,7 +277,6 @@ def train_model(X, y, model_type, param_grid):
         pred_test = np.full_like(y_test, y_tv.mean())
         return pred_test, y_test
 
-    # Подбор гиперпараметров через TimeSeriesSplit (3 folds)
     tscv = TimeSeriesSplit(n_splits=3)
     best_score = -np.inf
     best_params = param_grid[0] if param_grid else {}
@@ -275,24 +286,15 @@ def train_model(X, y, model_type, param_grid):
         for train_idx, val_idx in tscv.split(X_tv):
             if model_type == 'ridge':
                 model = Ridge(**params, random_state=42)
-            elif model_type == 'gbm':
-                if HAS_XGB:
-                    # Используем XGBRegressor, но с параметрами GBM (n_estimators, max_depth, learning_rate)
-                    model = XGBRegressor(**params, random_state=42, verbosity=0)
-                else:
-                    model = GradientBoostingRegressor(**params, random_state=42)
-            elif model_type == 'xgboost':
+            elif model_type in ('gbm', 'xgboost'):
                 if HAS_XGB:
                     model = XGBRegressor(**params, random_state=42, verbosity=0)
                 else:
-                    # fallback
                     model = GradientBoostingRegressor(**params, random_state=42)
             else:
                 raise ValueError(f"Unknown model_type {model_type}")
-
             model.fit(X_tv[train_idx], y_tv[train_idx])
             pred = model.predict(X_tv[val_idx])
-            # Используем R² как метрику для выбора гиперпараметров
             sc = r2_score(y_tv[val_idx], pred)
             scores.append(sc)
         mean_score = np.mean(scores)
@@ -300,28 +302,20 @@ def train_model(X, y, model_type, param_grid):
             best_score = mean_score
             best_params = params
 
-    # Финальная модель на всей train+val
     if model_type == 'ridge':
         final_model = Ridge(**best_params, random_state=42)
-    elif model_type == 'gbm':
-        if HAS_XGB:
-            final_model = XGBRegressor(**best_params, random_state=42, verbosity=0)
-        else:
-            final_model = GradientBoostingRegressor(**best_params, random_state=42)
-    elif model_type == 'xgboost':
+    elif model_type in ('gbm', 'xgboost'):
         if HAS_XGB:
             final_model = XGBRegressor(**best_params, random_state=42, verbosity=0)
         else:
             final_model = GradientBoostingRegressor(**best_params, random_state=42)
     else:
-        raise ValueError(f"Unknown model_type {model_type}")
-
+        raise ValueError
     final_model.fit(X_tv, y_tv)
     pred_test = final_model.predict(X_test)
     return pred_test, y_test
 
 def evaluate(pred, true, eval_metric, threshold):
-    """Возвращает (значение_метрики, passed)."""
     if eval_metric == 'r2':
         val = r2_score(true, pred)
         passed = (threshold is not None) and (val >= threshold)
@@ -336,7 +330,8 @@ def evaluate(pred, true, eval_metric, threshold):
         passed = False
     return val, passed
 
-def run_non_adaptive(ds: Dict[str, np.ndarray], label: str, biz_fn: Callable, lag_true: int):
+def run_non_adaptive(ds: Dict[str, np.ndarray], label: str, biz_fn: Callable, lag_true: int,
+                     extrapolate: bool = False, extrapolate_threshold: float = 0.8):
     cpu = ds["cpu"]
     biz = biz_fn(cpu, lag_true)
     n = ds["n"]
@@ -345,47 +340,100 @@ def run_non_adaptive(ds: Dict[str, np.ndarray], label: str, biz_fn: Callable, la
     print(f"  Pattern : {label}  |  Dataset : {ds['name']}")
     print(f"  Biz: mean={biz.mean():.1f}  std={biz.std():.1f}")
 
+    if extrapolate:
+        print(f"  EXTRAPOLATION MODE: train on points with biz < {extrapolate_threshold*100:.0f}% of max(biz_train)")
+
     # Для каждого таргета определяем лаг, r*, rel_std
-    results = []
-    print("\n  Target   |  lag  |   r*   | rel_std | model      | metric  |  value  | PASS?")
-    print("  ---------+-------+--------+---------+------------+---------+---------+------")
+    # Шапка таблицы зависит от режима
+    if extrapolate:
+        print("\n  Target   |  lag  |   r*   | model      | metric  | Train R² | Test R²  |  MAE_test | MAPE_test")
+        print("  ---------+-------+--------+------------+---------+----------+----------+-----------+----------")
+    else:
+        print("\n  Target   |  lag  |   r*   | rel_std | model      | metric  |  value  | PASS?")
+        print("  ---------+-------+--------+---------+------------+---------+---------+------")
+
     for key in TARGET_KEYS:
-        # Определяем лаг и r* на обучающей выборке
+        # Определяем лаг и r* на обучающей выборке (первые 80% времени)
         split = int(TRAIN_RATIO * n)
         biz_train = biz[:split]
         sys_train = ds[key][:split]
         lag, r = find_lag_and_corr(biz_train, sys_train)
-        # Относительная дисперсия на всей выборке
         mean_val = ds[key].mean()
         std_val = ds[key].std()
         rel_std = std_val / (mean_val + 1e-9)
 
-        # Выбираем модель и метрику
-        model_type, eval_metric, threshold, param_grid = select_model_and_metric(r, rel_std)
+        model_type, eval_metric, threshold, param_grid = select_model_and_metric(r, rel_std, extrapolate=extrapolate)
 
-        # Строим признаки (всегда полные)
-        X = build_features_full(biz, ds, lag)
-        y = ds[key][LOOKBACK:n-1]
+        if extrapolate:
+            # Строим признаки для всей выборки, но сначала нужно вычислить max_biz_train на обучающих точках (первые 80% по времени)
+            # Для этого получим текущие значения biz для индексов i (от LOOKBACK до n-2)
+            indices = np.arange(LOOKBACK, n-1)
+            biz_current = biz[indices]
+            split_idx = int(TRAIN_RATIO * len(biz_current))
+            max_biz_train = np.max(biz_current[:split_idx])
+            biz_threshold = extrapolate_threshold * max_biz_train
 
-        # Обучаем
-        pred, y_test = train_model(X, y, model_type, param_grid)
-        value, passed = evaluate(pred, y_test, eval_metric, threshold)
+            # Строим признаки с признаком превышения (max_biz_train)
+            X_full = build_features_full(biz, ds, lag, max_biz_train=max_biz_train)
+            y_full = ds[key][LOOKBACK:n-1]
 
-        # Для красивого вывода
-        model_str = model_type[:10] if len(model_type) <= 10 else model_type[:7]+'...'
-        metric_str = eval_metric[:7]
-        pass_str = 'YES' if passed else ('NO' if threshold is not None else '---')
-        print(f"  {key:<8} | {lag:3d}   | {r:6.3f} | {rel_std:7.4f} | {model_str:10s} | {metric_str:7s} | {value:7.4f} | {pass_str:>4}")
+            train_mask = biz_current < biz_threshold
+            test_mask = ~train_mask
+            if np.sum(test_mask) == 0:
+                print(f"  {key:<8} | нет тестовых точек с biz >= {biz_threshold:.2f}")
+                continue
 
-        results.append((key, r, rel_std, model_type, eval_metric, value, passed))
+            X_train = X_full[train_mask]
+            y_train = y_full[train_mask]
+            X_test = X_full[test_mask]
+            y_test = y_full[test_mask]
 
-    return results
+            # Обучаем модель на train (без временного CV, так как уже разделили по biz)
+            if model_type == 'mean_baseline':
+                pred_test = np.full_like(y_test, y_train.mean())
+                pred_train = np.full_like(y_train, y_train.mean())
+            else:
+                if model_type == 'ridge':
+                    model = Ridge(alpha=1.0, random_state=42)
+                elif model_type in ('gbm', 'xgboost'):
+                    if HAS_XGB:
+                        model = XGBRegressor(n_estimators=300, max_depth=4, learning_rate=0.05, random_state=42, verbosity=0)
+                    else:
+                        model = GradientBoostingRegressor(n_estimators=300, max_depth=4, learning_rate=0.05, random_state=42)
+                else:
+                    raise ValueError
+                model.fit(X_train, y_train)
+                pred_train = model.predict(X_train)
+                pred_test = model.predict(X_test)
+
+            train_r2 = r2_score(y_train, pred_train)
+            test_r2 = r2_score(y_test, pred_test)
+            mae_test = mean_absolute_error(y_test, pred_test)
+            mape_test = np.mean(np.abs((y_test - pred_test) / (y_test + 1e-9))) * 100
+
+            model_str = model_type[:10] if len(model_type) <= 10 else model_type[:7]+'...'
+            print(f"  {key:<8} | {lag:3d}   | {r:6.3f} | {model_str:10s} | {eval_metric:7s} | {train_r2:8.4f} | {test_r2:8.4f} | {mae_test:9.2f} | {mape_test:8.1f}%")
+        else:
+            # Обычный режим (без экстраполяции)
+            X = build_features_full(biz, ds, lag, max_biz_train=None)
+            y = ds[key][LOOKBACK:n-1]
+            pred, y_test = train_model(X, y, model_type, param_grid)
+            value, passed = evaluate(pred, y_test, eval_metric, threshold)
+            model_str = model_type[:10] if len(model_type) <= 10 else model_type[:7]+'...'
+            metric_str = eval_metric[:7]
+            pass_str = 'YES' if passed else ('NO' if threshold is not None else '---')
+            print(f"  {key:<8} | {lag:3d}   | {r:6.3f} | {rel_std:7.4f} | {model_str:10s} | {metric_str:7s} | {value:7.4f} | {pass_str:>4}")
+
+    return
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=["alibaba","google","both"], default="alibaba")
     parser.add_argument("--pattern", choices=list(PATTERNS)+["all"], default="sinusoidal")
     parser.add_argument("--lag", type=int, default=TRUE_LAG)
+    parser.add_argument("--extrapolate", action="store_true", help="Run extrapolation test (train on low biz, test on high biz)")
+    parser.add_argument("--extrapolate-threshold", type=float, default=0.8,
+                        help="Quantile of max biz in training to use as threshold (default 0.8)")
     args = parser.parse_args()
 
     datasets = []
@@ -402,16 +450,23 @@ def main():
     to_run = list(PATTERNS.items()) if args.pattern == "all" else [(args.pattern, PATTERNS[args.pattern])]
 
     print("=" * 80)
-    print("  NON-ADAPTIVE (always full features) with MODEL SELECTION")
+    if args.extrapolate:
+        print("  EXTRAPOLATION TEST: train on low business metric, test on high business metric")
+        print(f"  Threshold = {args.extrapolate_threshold*100:.0f}% of max(biz) in training (first 80% time points)")
+        print("  Added feature: biz_above_max = max(0, biz[i] - max_biz_train)")
+        print("  For low variance targets, ridge is used instead of mean_baseline for extrapolation")
+    else:
+        print("  NON-ADAPTIVE (always full features) with MODEL SELECTION")
     print("  Business metric: _cpu_to_proxy (only CPU)")
     print(f"  Embedded lag: {args.lag}step = {args.lag*STEP_SECONDS//60}min")
-    print("  Model selection based on r* and rel_std (see table)")
     print("=" * 80)
 
     for ds in datasets:
         print(f"\n{'━'*80}\n  Dataset: {ds['name']}\n{'━'*80}")
         for pname, (label, fn) in to_run:
-            run_non_adaptive(ds, label, fn, args.lag)
+            run_non_adaptive(ds, label, fn, args.lag,
+                             extrapolate=args.extrapolate,
+                             extrapolate_threshold=args.extrapolate_threshold)
 
 if __name__ == "__main__":
     main()

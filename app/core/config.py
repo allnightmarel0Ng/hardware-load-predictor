@@ -85,6 +85,7 @@ class Settings:
         self.retrain_interval_hours: int   = int(app.get("retrain_interval_hours", 24))
         self.log_level:              str   = app.get("log_level", "INFO")
         self.use_prometheus_stub:    bool  = bool(app.get("use_prometheus_stub", False))
+        self.step_seconds:           int   = int(app.get("step_seconds", 300))
 
         # PromQL templates — fixed, not overridable via config
         self.prometheus_cpu_query:     str = _CPU_QUERY

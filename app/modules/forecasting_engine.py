@@ -60,10 +60,10 @@ def _get_latest_ready_model(db, config_id):
     return get_latest_ready_model(db, config_id)
 
 
-def _get_get_target_extra_features(target_key, hist):
+def _get_target_extra_features(target_key: str, hist: "np.ndarray") -> list:
     """Lazy import wrapper to avoid circular dependency."""
     from app.modules.model_trainer import _target_extra_features
-    return _get_target_extra_features(target_key, hist)
+    return _target_extra_features(target_key, hist)
 
 
 class TargetPrediction(NamedTuple):
@@ -218,8 +218,14 @@ def _infer_one_target(
     sys_ctx: dict[str, np.ndarray],
     target_key: str,
     at_time: datetime | None = None,
+    hypothetical: bool = False,
 ) -> float:
-    """Predict one target. Returns point estimate (float)."""
+    """Predict one target. Returns point estimate (float).
+
+    hypothetical=True: replace live AR context with training-time means.
+    Use this when the user asks 'what if RPS=X?' rather than
+    'what will happen in the next N minutes?'.
+    """
     if info["model_type"] == "mean_baseline" or info["model"] is None:
         return float(info["mean_val"])
 
@@ -228,7 +234,14 @@ def _infer_one_target(
     model         = info["model"]
     max_biz_train = info.get("max_biz_train")
 
-    X_row = _build_inference_row(biz_hist, sys_ctx, target_key, tau, at_time,
+    if hypothetical and "mean_sys_ctx" in info:
+        # Replace live AR features with training-time mean repeated AR_WINDOW times
+        mean_ctx = info["mean_sys_ctx"]
+        ctx = {k: np.full(AR_WINDOW, v) for k, v in mean_ctx.items()}
+    else:
+        ctx = sys_ctx
+
+    X_row = _build_inference_row(biz_hist, ctx, target_key, tau, at_time,
                                   max_biz_train=max_biz_train)
 
     X_sc = scaler.transform(X_row) if scaler is not None else X_row
@@ -241,15 +254,16 @@ def _run_inference_v3(
     biz_hist: np.ndarray,
     sys_ctx: dict[str, np.ndarray],
     at_time: datetime | None = None,
+    hypothetical: bool = False,
 ) -> InferencePrediction:
     """Full v3 inference: five independent models."""
     pt = artifact["per_target"]
 
-    cpu_pt = round(float(np.clip(_infer_one_target(pt["cpu"],     biz_hist, sys_ctx, "cpu",     at_time), 0, 100)), 2)
-    rgb_pt = round(max(0.0, _infer_one_target(pt["ram_gb"],  biz_hist, sys_ctx, "ram_gb",  at_time)), 2)
-    rpt_pt = round(float(np.clip(_infer_one_target(pt["ram_pct"], biz_hist, sys_ctx, "ram_pct", at_time), 0, 100)), 2)
-    net_pt = round(max(0.0, _infer_one_target(pt["net"],     biz_hist, sys_ctx, "net",     at_time)), 2)
-    dsk_pt = round(float(np.clip(_infer_one_target(pt["disk"],    biz_hist, sys_ctx, "disk",    at_time), 0, 100)), 2)
+    cpu_pt = round(float(np.clip(_infer_one_target(pt["cpu"],     biz_hist, sys_ctx, "cpu",     at_time, hypothetical), 0, 100)), 2)
+    rgb_pt = round(max(0.0, _infer_one_target(pt["ram_gb"],  biz_hist, sys_ctx, "ram_gb",  at_time, hypothetical)), 2)
+    rpt_pt = round(float(np.clip(_infer_one_target(pt["ram_pct"], biz_hist, sys_ctx, "ram_pct", at_time, hypothetical), 0, 100)), 2)
+    net_pt = round(max(0.0, _infer_one_target(pt["net"],     biz_hist, sys_ctx, "net",     at_time, hypothetical)), 2)
+    dsk_pt = round(float(np.clip(_infer_one_target(pt["disk"],    biz_hist, sys_ctx, "disk",    at_time, hypothetical), 0, 100)), 2)
 
     # No quantile intervals in v3 (can be added later per target)
     return InferencePrediction(
@@ -293,7 +307,15 @@ def forecast(
     db: Session,
     config: ForecastingConfig,
     business_metric_value: float,
+    hypothetical: bool = True,
 ) -> ForecastResult:
+    """Produce and persist a single-step forecast.
+
+    hypothetical=True (default): AR context is replaced with training-time
+    means so the prediction reflects 'what would happen at biz=X' rather
+    than 'what will happen in the next few minutes given the current state'.
+    Set hypothetical=False for short-horizon operational forecasts.
+    """
     model_rec = _get_latest_ready_model(db, config.id)
     if model_rec is None:
         raise ValueError(
@@ -302,8 +324,8 @@ def forecast(
         )
 
     logger.info(
-        "Forecast: config_id=%d model_id=%d (v%d) biz=%.2f",
-        config.id, model_rec.id, model_rec.version, business_metric_value,
+        "Forecast: config_id=%d model_id=%d (v%d) biz=%.2f hypothetical=%s",
+        config.id, model_rec.id, model_rec.version, business_metric_value, hypothetical,
     )
 
     artifact = _load_artifact(model_rec)
@@ -311,7 +333,8 @@ def forecast(
     if _is_v3(artifact):
         biz_hist = _fetch_biz_history(config, business_metric_value)
         sys_ctx  = _fetch_system_context(config)
-        pred     = _run_inference_v3(artifact, biz_hist, sys_ctx)
+        pred     = _run_inference_v3(artifact, biz_hist, sys_ctx,
+                                     hypothetical=hypothetical)
     else:
         pred = _run_inference_legacy(artifact, business_metric_value)
 

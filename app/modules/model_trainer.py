@@ -59,6 +59,7 @@ CORR_LOW    = 0.3
 CORR_MEDIUM = 0.5
 CORR_HIGH   = 0.7
 REL_STD_MIN = 0.05   # below this → metric is nearly constant → mean baseline
+REL_STD_MAX = 2.0    # above this → metric is pure noise → mean baseline
 
 TARGET_KEYS = ["cpu", "ram_gb", "ram_pct", "net", "disk"]
 
@@ -156,7 +157,9 @@ def _select_model_type(r: float, rel_std: float) -> str:
     sufficient and nonlinear patterns are important.
     """
     if rel_std < REL_STD_MIN:
-        return "mean_baseline"
+        return "mean_baseline"   # nearly constant — predicting mean is optimal
+    if rel_std > REL_STD_MAX:
+        return "mean_baseline"   # pure noise — no model can beat the mean
     if r >= CORR_HIGH:
         return "xgboost"
     if r >= CORR_MEDIUM:
@@ -459,7 +462,7 @@ def _train_single_target(
     if idle_removed > 0:
         logger.info(
             "  %s: removed %d/%d points (biz≤%.2f OR sys≤%.2f — filtered non-correlated)",
-            target_key, idle_removed, n_rs, biz_p10, sys_p10,
+            target_key, idle_removed, n_rs, biz_threshold, sys_threshold,
         )
 
     # Use active data for training; fall back to full if too few active points
@@ -543,6 +546,12 @@ def _train_single_target(
         "model_type":    model_type,
         "mean_val":      float(y_tv.mean()),   # for mean_baseline fallback
         "max_biz_train": max_biz_train,        # for biz_above_max at inference
+        # Mean of each system metric over the active training window.
+        # Used in hypothetical inference mode to replace AR features
+        # so predictions aren't anchored to the current live state.
+        "mean_sys_ctx": {
+            k: float(arr.mean()) for k, arr in sys_fit.items()
+        },
         "metrics": {
             f"r2_{target_key}":   round(r2, 4),
             f"mae_{target_key}":  round(mae, 4),

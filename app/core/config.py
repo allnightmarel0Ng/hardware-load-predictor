@@ -63,11 +63,11 @@ def _load_yaml() -> dict:
 #   instance_label set  → instance="<label>"   (exact per-server match)
 #   instance_label None → instance=~".+"        (all instances)
 
-_CPU_QUERY     = '100 - avg(irate(node_cpu_seconds_total{{mode="idle",{instance}}}[5m])) * 100'
+_CPU_QUERY     = '100 - avg(rate(node_cpu_seconds_total{{mode="idle",{instance}}}[5m])) * 100'
 _RAM_GB_QUERY  = "(node_memory_MemTotal_bytes{{{instance}}} - node_memory_MemAvailable_bytes{{{instance}}}) / 1073741824"
 _RAM_PCT_QUERY = "(1 - node_memory_MemAvailable_bytes{{{instance}}} / node_memory_MemTotal_bytes{{{instance}}}) * 100"
-_NET_QUERY     = "sum(irate(node_network_receive_bytes_total{{{instance}}}[5m])) * 8 / 1048576"
-_DISK_QUERY    = "avg(irate(node_disk_io_time_seconds_total{{{instance}}}[5m])) * 100"
+_NET_QUERY     = "sum(rate(node_network_receive_bytes_total{{{instance}}}[5m])) * 8 / 1048576"
+_DISK_QUERY    = "avg(rate(node_disk_io_time_seconds_total{{{instance}}}[5m])) * 100"
 
 
 class Settings:

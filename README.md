@@ -6,24 +6,6 @@ machine learning. Supports single-server and multi-server cluster deployments.
 
 ---
 
-## Module Status
-
-| # | Module | File | Status |
-|---|--------|------|--------|
-| 1 | Configuration Manager | `app/modules/config_manager.py` | ✅ Real |
-| 2 | Historical Data Collector | `app/modules/data_collector.py` | ✅ Real — Prometheus range API, 4 queries, series alignment |
-| 3 | Correlation Analyzer | `app/modules/correlation_analyzer.py` | ✅ Real — Pearson + Spearman CCF, lag sweep 0–60 min |
-| 4 | Model Trainer | `app/modules/model_trainer.py` | ✅ Real — GradientBoostingRegressor + Ridge fallback |
-| 5 | Forecasting Engine | `app/modules/forecasting_engine.py` | ✅ Real — joblib inference, 9-feature vector |
-| 6 | Accuracy Monitor | `app/modules/accuracy_monitor.py` | ✅ Real — Prometheus actuals, MAE/RMSE/R², PSI drift |
-| 7 | Request Handler (API) | `app/modules/request_handler.py` | ✅ Real REST API |
-| + | Job Runner | `app/modules/job_runner.py` | ✅ Real — async ThreadPoolExecutor |
-| + | Drift Detector | `app/modules/drift_detector.py` | ✅ Real — PSI (Population Stability Index) |
-| + | Server Group Manager | `app/modules/server_group_manager.py` | ✅ Real — multi-server CRUD |
-| + | Cluster Forecaster | `app/modules/cluster_forecaster.py` | ✅ Real — aggregate forecast across N servers |
-
----
-
 ## Quickstart
 
 ```bash

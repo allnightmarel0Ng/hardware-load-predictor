@@ -87,6 +87,7 @@ def _run_training_job(job_id: int) -> None:
             port=config.port,
             business_formula=config.business_metric_formula,
             lookback_days=job.lookback_days,
+            instance_label=getattr(config, "instance_label", None),
         )
         report = analyze(bundle)
         if report.is_business_constant:

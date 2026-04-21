@@ -245,8 +245,50 @@ def _infer_one_target(
                                   max_biz_train=max_biz_train)
 
     X_sc = scaler.transform(X_row) if scaler is not None else X_row
+    pred = float(model.predict(X_sc)[0])
 
-    return float(model.predict(X_sc)[0])
+    # ── Extrapolation beyond training range ──────────────────────────────────
+    # All models (GBR, XGBoost, Ridge) can produce wrong extrapolation when
+    # hypothetical=True, because AR features are fixed at mean_sys_ctx which
+    # creates a confounded relationship with biz.
+    # Solution: use biz_only_ridge (trained without AR features) for
+    # hypothetical extrapolation — it has a clean biz→sys relationship.
+    biz_current = biz_hist[-1]
+    if max_biz_train is not None and biz_current > max_biz_train:
+        boundary_pred = info.get("extrap_boundary_pred", pred)
+
+        if hypothetical and info.get("biz_only_ridge") is not None:
+            from app.modules.model_trainer import N_BIZ_FEATURES
+            biz_only_ridge = info["biz_only_ridge"]
+            X_biz_s = X_sc[:, :N_BIZ_FEATURES]
+            ridge_pred_raw = float(biz_only_ridge.predict(X_biz_s)[0])
+            names = ["sin_h","cos_h","sin_d","cos_d","trend",
+                     "bl","bn","d1","d2","bz","bl*sh","bl*ch","above","rel"]
+            feat_str = "  ".join(f"{n}={v:.2f}" for n,v in zip(names, X_biz_s[0]))
+            logger.info("  biz feats scaled: %s", feat_str)
+            logger.info("  coefs: %s", "  ".join(f"{n}={c:.2f}" for n,c in zip(names, biz_only_ridge.coef_)))
+            logger.info("  raw_pred=%.2f  boundary=%.2f", ridge_pred_raw, boundary_pred)
+            ridge_pred = max(ridge_pred_raw, boundary_pred)
+        elif not hypothetical and info.get("extrap_ridge") is not None:
+            extrap_ridge = info["extrap_ridge"]
+            ridge_pred = float(extrap_ridge.predict(X_sc)[0])
+            ridge_pred = max(ridge_pred, boundary_pred)
+        else:
+            ridge_pred = boundary_pred
+
+        # Blend: at boundary → boundary_pred, at 2×max → ridge_pred
+        alpha = min(1.0, (biz_current - max_biz_train) / (max_biz_train + 1e-9))
+        pred  = float(boundary_pred) * (1 - alpha) + float(ridge_pred) * alpha
+        pred  = max(0.0, float(pred))
+
+        logger.info(
+            "  extrap: biz=%.2f > max=%.2f  hyp=%s  alpha=%.2f  "
+            "boundary=%.2f  ridge=%.2f  → pred=%.2f",
+            biz_current, max_biz_train, hypothetical, alpha,
+            boundary_pred, ridge_pred, pred,
+        )
+
+    return float(pred)
 
 
 def _run_inference_v3(
@@ -331,7 +373,13 @@ def forecast(
     artifact = _load_artifact(model_rec)
 
     if _is_v3(artifact):
-        biz_hist = _fetch_biz_history(config, business_metric_value)
+        if hypothetical:
+            # Fill entire history with current_value so derivative features
+            # (d1, d2, bz, bn) are neutral (0 or 1) — no fake spike artefacts
+            # from inserting a large biz value into a low-biz history.
+            biz_hist = np.full(AR_WINDOW, business_metric_value)
+        else:
+            biz_hist = _fetch_biz_history(config, business_metric_value)
         sys_ctx  = _fetch_system_context(config)
         pred     = _run_inference_v3(artifact, biz_hist, sys_ctx,
                                      hypothetical=hypothetical)

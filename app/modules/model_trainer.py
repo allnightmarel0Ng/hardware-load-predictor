@@ -6,19 +6,21 @@ Key changes from v2:
   - Per-target lag: lag is found individually for each target from
     correlation analysis on the training split only (first 80%).
   - Adaptive model selection based on r* and rel_std:
-      r* ≥ 0.7  → Ridge+Poly(degree=2)  extrapolates beyond training range
-      r* ≥ 0.5  → GBR                   interpolates within training range
-      r* ≥ 0.3  → Ridge                 linear fallback
-      r* < 0.3  → Ridge                 weak signal
-      rel_std < 0.05 → mean baseline    nearly constant metric
+      r* ≥ 0.7  → XGBoost + extrapolation tail  strong correlation
+      r* ≥ 0.5  → GBR     + extrapolation tail  moderate correlation
+      r* ≥ 0.3  → Ridge                          weak signal
+      r* < 0.3  → Ridge                          very weak signal
+      rel_std < 0.05 or > 2.0 → mean baseline    constant / pure noise
 
-  Why Ridge+Poly instead of XGBoost for strong correlations?
-    XGBoost and GBR are tree-based models — they cannot extrapolate beyond
-    the range of values seen during training. For the core use case of this
-    system ("what will CPU be if RPS grows to X?"), extrapolation is
-    essential. Ridge with polynomial features (degree=2) fits a smooth curve
-    through the training data and extrapolates it naturally, giving physically
-    meaningful predictions for unseen business metric values.
+  Extrapolation beyond training range (biz > max_biz_train):
+    Tree models (XGBoost, GBR) return a constant at the edge of training
+    data — they cannot extrapolate. To handle unseen high-load scenarios,
+    we fit an additional Ridge model on the top-30% of training data and
+    compute its slope (d_sys/d_biz). At inference, if biz > max_biz_train:
+      pred = boundary_pred + slope * (biz - max_biz_train)
+    where boundary_pred is the tree model's prediction at max_biz_train.
+    This gives physically meaningful linear extrapolation beyond the
+    training envelope for any r* value.
   - Advanced per-target features:
       CPU:  EWMA (α=0.1/0.3/0.7), CV, exceed_70, slope
       RAM:  release_speed, retention, steps_since_low, rel_to_30
@@ -51,13 +53,14 @@ from app.modules.data_collector import MetricsBundle
 logger = logging.getLogger(__name__)
 
 LOOKBACK          = 30
+N_BIZ_FEATURES    = 14   # biz+time features before AR block (used for biz-only Ridge)
 TEST_SPLIT_RATIO  = 0.20
 TRAIN_RATIO       = 1.0 - TEST_SPLIT_RATIO
 
 # Adaptive model thresholds
-CORR_LOW    = 0.3
-CORR_MEDIUM = 0.5
-CORR_HIGH   = 0.7
+CORR_LOW    = 0.3   # below this → mean_baseline (too weak to model)
+CORR_MEDIUM = 0.5   # r* ≥ 0.5 → GBR; 0.3..0.5 → Ridge
+CORR_HIGH   = 0.7   # r* ≥ 0.7 → XGBoost
 REL_STD_MIN = 0.05   # below this → metric is nearly constant → mean baseline
 REL_STD_MAX = 2.0    # above this → metric is pure noise → mean baseline
 
@@ -147,24 +150,25 @@ def _select_model_type(r: float, rel_std: float) -> str:
     Choose algorithm based on correlation strength and metric variance.
     Returns one of: 'xgboost', 'gbr', 'ridge', 'mean_baseline'.
 
-    xgboost = XGBoost Regressor for strong correlations (r* ≥ 0.7).
-    Used for strongly correlated metrics because it can extrapolate
-    beyond the training range — essential for the core use case of
-    predicting system load at unseen business metric values.
+    xgboost = XGBoost for strong correlations (r* ≥ 0.7).
+    gbr     = GBR for moderate correlations (r* ≥ 0.5).
+    ridge   = Ridge for weak signal (r* < 0.5).
 
-    gbr = Gradient Boosting Regressor.
-    Used for moderately correlated metrics where interpolation is
-    sufficient and nonlinear patterns are important.
+    All non-baseline models get an extrapolation tail fitted separately
+    (see _fit_extrapolation_tail). The tail is used at inference when
+    biz exceeds max_biz_train.
     """
     if rel_std < REL_STD_MIN:
         return "mean_baseline"   # nearly constant — predicting mean is optimal
     if rel_std > REL_STD_MAX:
         return "mean_baseline"   # pure noise — no model can beat the mean
+    if r < CORR_LOW:
+        return "mean_baseline"   # too weak to model — mean is more honest
     if r >= CORR_HIGH:
         return "xgboost"
     if r >= CORR_MEDIUM:
         return "gbr"
-    return "ridge"
+    return "ridge"              # Ridge: weak-moderate signal, extrapolates OK
 
 
 # ── Advanced per-target feature helpers ──────────────────────────────────────
@@ -269,6 +273,7 @@ def _build_features_for_target(
     target_key: str,
     n: int,
     max_biz_train: float | None = None,
+    step_seconds: int = 60,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Build feature matrix X and target vector y for one system metric.
@@ -288,8 +293,10 @@ def _build_features_for_target(
 
     for i in range(LOOKBACK, n - 1):
         # ── Time features ──────────────────────────────────────────────────
-        hour   = (i / 60.0) % 24        # assume 1-min steps; adjust for STEP
-        dow    = (i / (24 * 60.0)) % 7
+        # Use actual step_seconds so hour/dow reflect real elapsed time
+        elapsed_min = i * step_seconds / 60.0
+        hour   = elapsed_min % (24 * 60) / 60.0
+        dow    = (elapsed_min / (24 * 60.0)) % 7
         sin_h  = math.sin(2 * math.pi * hour / 24)
         cos_h  = math.cos(2 * math.pi * hour / 24)
         sin_d  = math.sin(2 * math.pi * dow  / 7)
@@ -352,6 +359,61 @@ def _make_estimator(model_type: str, params: dict):
         return GradientBoostingRegressor(**params, random_state=42,
                                          subsample=0.8, min_samples_leaf=5)
     return Ridge(**params)
+
+
+def _fit_extrapolation_ridge(
+    X_tv_s: np.ndarray,     # scaled feature matrix (after main StandardScaler)
+    y_tv: np.ndarray,
+    biz_values: np.ndarray,
+    max_biz_train: float,
+) -> dict:
+    """
+    Fit two dedicated Ridge models for use when biz > max_biz_train.
+
+    biz_only_ridge: trained on RAW (unscaled) biz+time features with its
+      own StandardScaler. Using raw features is critical — in the scaled
+      space the main scaler can flip the sign of biz (because high-biz
+      periods are underrepresented vs idle periods), causing Ridge to learn
+      a negative slope. In raw space the true positive biz→sys relationship
+      is preserved.
+
+    extrap_ridge: trained on all scaled features, used for live extrapolation.
+    """
+    n = len(biz_values)
+    fallback = {
+        "biz_only_ridge":  None,
+        "biz_only_scaler": None,
+        "extrap_ridge":    None,
+        "boundary_pred":   float(y_tv.mean()),
+    }
+    if n < 20 or max_biz_train <= 0:
+        return fallback
+
+    # ── Biz-only Ridge on already-scaled features ─────────────────────────
+    # Use X_tv_s (scaled by main scaler) sliced to biz+time features only.
+    # No separate scaler — main scaler is reused at inference via X_sc[:, :N_BIZ_FEATURES].
+    X_biz_s = X_tv_s[:, :N_BIZ_FEATURES]
+    biz_only_ridge = Ridge(alpha=1.0)
+    biz_only_ridge.fit(X_biz_s, y_tv)
+
+    # ── Full-feature Ridge on scaled features ─────────────────────────────
+    extrap_ridge = Ridge(alpha=1.0)
+    extrap_ridge.fit(X_tv_s, y_tv)
+
+    # ── Boundary prediction ───────────────────────────────────────────────
+    threshold = np.percentile(biz_values, 70)
+    mask = biz_values >= threshold
+    boundary_pred = float(y_tv[mask].mean()) if mask.sum() >= 5 else float(y_tv.mean())
+
+    logger.info(
+        "  extrap Ridge: biz_only(raw) + full fitted  boundary_pred=%.2f  n_top=%d/%d",
+        boundary_pred, int(mask.sum()), n,
+    )
+    return {
+        "biz_only_ridge":  biz_only_ridge,
+        "extrap_ridge":    extrap_ridge,
+        "boundary_pred":   boundary_pred,
+    }
 
 
 def _compute_sample_weights(biz: np.ndarray) -> np.ndarray:
@@ -499,7 +561,8 @@ def _train_single_target(
 
     # Build features on active (filtered) data, passing max_biz_train for biz_above_max
     X, y = _build_features_for_target(biz_fit, sys_fit, lag, target_key, n_fit,
-                                       max_biz_train=max_biz_train)
+                                       max_biz_train=max_biz_train,
+                                       step_seconds=best_step_seconds)
 
     # Temporal split: 80% train+val, 20% test
     n_rows = len(X)
@@ -529,6 +592,21 @@ def _train_single_target(
         model_obj = _train_with_cv(X_tv_s, y_tv, model_type, weights_tv=w_tv)
         y_pred    = model_obj.predict(X_te_s)
 
+    # ── Extrapolation Ridge ──────────────────────────────────────────────────
+    # Fit a separate Ridge model on all training data for use when
+    # biz > max_biz_train. Ridge extrapolates naturally; GBR/XGBoost do not.
+    biz_for_extrap = biz_fit[LOOKBACK:n_fit - 1][:-te]
+    if model_type == "mean_baseline" or model_obj is None:
+        extrap = {
+            "extrap_ridge":  None,
+            "extrap_scaler": scaler,
+            "boundary_pred": float(y_tv.mean()),
+        }
+    else:
+        extrap = _fit_extrapolation_ridge(
+            X_tv_s, y_tv, biz_for_extrap, max_biz_train
+        )
+
     # Metrics
     r2  = float(r2_score(y_te, y_pred))
     mae = float(mean_absolute_error(y_te, y_pred))
@@ -552,6 +630,14 @@ def _train_single_target(
         "mean_sys_ctx": {
             k: float(arr.mean()) for k, arr in sys_fit.items()
         },
+        # Extrapolation models for biz > max_biz_train:
+        # - biz_only_ridge: trained on biz+time features only (no AR),
+        #   used in hypothetical inference to avoid AR confounding.
+        # - extrap_ridge: full-feature Ridge for live extrapolation.
+        "biz_only_ridge":       extrap.get("biz_only_ridge"),
+        "biz_only_scaler":      extrap.get("biz_only_scaler"),
+        "extrap_ridge":         extrap.get("extrap_ridge"),
+        "extrap_boundary_pred": extrap["boundary_pred"],
         "metrics": {
             f"r2_{target_key}":   round(r2, 4),
             f"mae_{target_key}":  round(mae, 4),

@@ -1,30 +1,34 @@
 """
-Module 5 — Forecasting Engine
-Produces CPU / RAM / Network predictions from a trained model artifact.
+Module 5 — Forecasting Engine  (v3: per-target adaptive inference)
 
-Two capabilities added in Tier 1:
-
-  1. Prediction intervals (80% coverage, 10th–90th percentile)
-     Each forecast response includes:
-       predicted_*   — point estimate (median GBR)
-       lower_*       — 10th-percentile bound
-       upper_*       — 90th-percentile bound
-
-  2. Forecast horizon (multi-step)
-     The engineer supplies a list of (business_value, minutes_ahead) pairs
-     and receives a prediction per step.
-
-Artifact schema (written by model_trainer._fit_and_evaluate):
+Artifact schema (v3):
     {
-      "model":       MultiOutputRegressor  (point estimator)
-      "model_lower": MultiOutputRegressor  (10th percentile) | None
-      "model_upper": MultiOutputRegressor  (90th percentile) | None
-      "scaler":      StandardScaler
+      "per_target": {
+          "cpu":     {"model": ..., "scaler": ..., "lag": int,
+                      "model_type": str, "mean_val": float, ...},
+          "ram_gb":  {...},
+          "ram_pct": {...},
+          "net":     {...},
+          "disk":    {...},
+      },
+      "version": "v3_per_target",
     }
+
+At inference time:
+  - Fetches last AR_WINDOW points of system metrics and business metric
+    from Prometheus (same host:port as in ForecastingConfig).
+  - Builds the same advanced feature vector used during training,
+    using each target's individual lag.
+  - Runs each target's model independently.
+  - Falls back gracefully to mean_val if model is None (mean_baseline).
+
+Backward compat: if artifact has old schema (key "model" at top level),
+  falls back to legacy single-model inference.
 """
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import NamedTuple
@@ -39,13 +43,30 @@ from app.models.db_models import (
     ForecastResult,
     TrainedModel,
 )
-from app.modules.model_trainer import get_latest_ready_model
+# Imported lazily inside functions to avoid circular import with model_trainer
+# (request_handler imports both modules at module level)
 
 logger = logging.getLogger(__name__)
 
+# Mirror constants from model_trainer — kept in sync manually
+LOOKBACK    = 30
+AR_WINDOW   = LOOKBACK + 5
+TARGET_KEYS = ["cpu", "ram_gb", "ram_pct", "net", "disk"]
+
+
+def _get_latest_ready_model(db, config_id):
+    """Lazy import wrapper to avoid circular dependency."""
+    from app.modules.model_trainer import get_latest_ready_model
+    return get_latest_ready_model(db, config_id)
+
+
+def _get_target_extra_features(target_key: str, hist: "np.ndarray") -> list:
+    """Lazy import wrapper to avoid circular dependency."""
+    from app.modules.model_trainer import _target_extra_features
+    return _target_extra_features(target_key, hist)
+
 
 class TargetPrediction(NamedTuple):
-    """Point estimate + 80% prediction interval for one target."""
     point: float
     lower: float | None
     upper: float | None
@@ -53,7 +74,6 @@ class TargetPrediction(NamedTuple):
 
 @dataclass
 class InferencePrediction:
-    """Full prediction for all five targets at one timestep."""
     cpu:         TargetPrediction
     ram_gb:      TargetPrediction
     ram_percent: TargetPrediction
@@ -61,148 +81,334 @@ class InferencePrediction:
     disk:        TargetPrediction
 
 
+# ── Artifact loading ──────────────────────────────────────────────────────────
+
 def _load_artifact(model: TrainedModel) -> dict:
     if not model.artifact_path:
-        raise ValueError(f"Model {model.id} has no artifact_path set.")
-    artifact = joblib.load(model.artifact_path)
-    artifact.setdefault("model_lower", None)
-    artifact.setdefault("model_upper", None)
-    return artifact
+        raise ValueError(f"Model {model.id} has no artifact_path.")
+    return joblib.load(model.artifact_path)
 
 
-def _build_inference_feature(
-    business_value: float,
+def _is_v3(artifact: dict) -> bool:
+    return artifact.get("version") == "v3_per_target"
+
+
+# ── Prometheus fetch helpers ──────────────────────────────────────────────────
+
+def _fetch_series(config: ForecastingConfig, query: str, n_points: int) -> np.ndarray:
+    from app.modules.data_collector import _query_prometheus
+    end   = datetime.utcnow()
+    start = end - timedelta(minutes=n_points + 5)
+    try:
+        series = _query_prometheus(config.host, config.port, query,
+                                   start, end, step_seconds=60)
+        if not series:
+            return np.zeros(n_points)
+        vals = np.array([p["value"] for p in series[-n_points:]], dtype=float)
+        if len(vals) < n_points:
+            vals = np.pad(vals, (n_points - len(vals), 0), mode="edge")
+        return vals[-n_points:]
+    except Exception as exc:
+        logger.warning("Prometheus fetch failed (%s): %s", query[:40], exc)
+        return np.zeros(n_points)
+
+
+def _fetch_system_context(config: ForecastingConfig) -> dict[str, np.ndarray]:
+    from app.core.config import settings
+    instance = getattr(config, "instance_label", None)
+    ifilter  = f'instance="{instance}"' if instance else 'instance=~".+"'
+    def q(tmpl): return tmpl.format(instance=ifilter)
+    return {
+        "cpu":     _fetch_series(config, q(settings.prometheus_cpu_query),     AR_WINDOW),
+        "ram_pct": _fetch_series(config, q(settings.prometheus_ram_pct_query), AR_WINDOW),
+        "net":     _fetch_series(config, q(settings.prometheus_net_query),     AR_WINDOW),
+        "disk":    _fetch_series(config, q(settings.prometheus_disk_query),    AR_WINDOW),
+    }
+
+
+def _fetch_biz_history(config: ForecastingConfig, current_value: float) -> np.ndarray:
+    from app.modules.data_collector import _query_prometheus
+    end   = datetime.utcnow()
+    start = end - timedelta(minutes=AR_WINDOW + 5)
+    try:
+        series = _query_prometheus(
+            config.host, config.port, config.business_metric_formula,
+            start, end, step_seconds=60,
+        )
+        if not series:
+            raise ValueError("empty")
+        vals = np.array([p["value"] for p in series[-AR_WINDOW:]], dtype=float)
+        if len(vals) < AR_WINDOW:
+            vals = np.pad(vals, (AR_WINDOW - len(vals), 0), mode="edge")
+        return np.append(vals[1:], current_value)
+    except Exception as exc:
+        logger.warning("Biz history fetch failed: %s", exc)
+        return np.full(AR_WINDOW, current_value)
+
+
+# ── Single-target inference feature vector ────────────────────────────────────
+
+def _build_inference_row(
+    biz_hist: np.ndarray,
+    sys_ctx: dict[str, np.ndarray],
+    target_key: str,
+    tau: int,
     at_time: datetime | None = None,
+    max_biz_train: float | None = None,
 ) -> np.ndarray:
-    t    = at_time or datetime.utcnow()
-    hour = t.hour + t.minute / 60.0
-    dow  = t.weekday()
-    return np.array([[
-        business_value,
-        business_value,
-        0.0,
-        business_value,
-        0.0,
-        np.sin(2 * np.pi * hour / 24.0),
-        np.cos(2 * np.pi * hour / 24.0),
-        np.sin(2 * np.pi * dow  / 7.0),
-        np.cos(2 * np.pi * dow  / 7.0),
-    ]], dtype=float)
+    """Build exactly one feature row (same logic as _build_features_for_target).
+
+    max_biz_train: stored in the model artifact at training time.
+        Used to compute biz_above_max — the extrapolation signal.
+    """
+    t   = at_time or datetime.utcnow()
+    i   = len(biz_hist) - 1
+    n   = len(biz_hist)
+
+    hour  = t.hour + t.minute / 60.0
+    dow   = t.weekday()
+    sin_h = math.sin(2 * math.pi * hour / 24)
+    cos_h = math.cos(2 * math.pi * hour / 24)
+    sin_d = math.sin(2 * math.pi * dow  / 7)
+    cos_d = math.cos(2 * math.pi * dow  / 7)
+    trend = 1.0
+
+    bl   = biz_hist[i - tau] if i >= tau else biz_hist[0]
+    rm30 = biz_hist[max(0, i - 30):i].mean() if i > 0 else bl
+    bn   = bl / (rm30 + 1e-9)
+    d1   = biz_hist[i] - biz_hist[i-1] if i >= 1 else 0.0
+    d2   = biz_hist[i-1] - biz_hist[i-2] if i >= 2 else 0.0
+    mu5b = biz_hist[max(0, i-5):i].mean() if i > 0 else bl
+    bz   = (biz_hist[i] - mu5b) / (biz_hist[max(0, i-5):i].std() + 1e-9) if i > 0 else 0.0
+
+    biz_above_max = max(0.0, bl - max_biz_train) if max_biz_train is not None else 0.0
+    biz_relative  = bl / (max_biz_train + 1e-9)  if max_biz_train is not None else 1.0
+
+    feats: list[float] = [
+        sin_h, cos_h, sin_d, cos_d, trend,
+        bl, bn, d1, d2, bz, bl * sin_h, bl * cos_h,
+        biz_above_max, biz_relative,
+    ]
+
+    for key in ("cpu", "ram_pct", "net", "disk"):
+        arr = sys_ctx.get(key, np.zeros(AR_WINDOW))
+        l1  = arr[-1]
+        l2  = arr[-2] if len(arr) >= 2 else arr[-1]
+        l3  = arr[-3] if len(arr) >= 3 else arr[-1]
+        m5  = arr[-5:].mean()  if len(arr) >= 5  else arr.mean()
+        m15 = arr[-15:].mean() if len(arr) >= 15 else arr.mean()
+        m30 = arr[-30:].mean() if len(arr) >= 30 else arr.mean()
+        s5  = arr[-5:].std()   + 1e-9 if len(arr) >= 5  else 1.0
+        s15 = arr[-15:].std()  + 1e-9 if len(arr) >= 15 else 1.0
+        feats.extend([l1, l2, l3, m5, m15, m30, s5, s15])
+
+    # Use sys_ctx for the target's own history (ram_gb not in ctx → use ram_pct proxy)
+    ctx_key = "ram_pct" if target_key == "ram_gb" else target_key
+    hist = sys_ctx.get(ctx_key, np.zeros(AR_WINDOW))
+    feats.extend(_get_target_extra_features(target_key, hist))
+
+    return np.array([feats], dtype=float)
 
 
-def _run_inference(
+# ── Core inference ────────────────────────────────────────────────────────────
+
+def _infer_one_target(
+    info: dict,
+    biz_hist: np.ndarray,
+    sys_ctx: dict[str, np.ndarray],
+    target_key: str,
+    at_time: datetime | None = None,
+    hypothetical: bool = False,
+) -> float:
+    """Predict one target. Returns point estimate (float).
+
+    hypothetical=True: replace live AR context with training-time means.
+    Use this when the user asks 'what if RPS=X?' rather than
+    'what will happen in the next N minutes?'.
+    """
+    if info["model_type"] == "mean_baseline" or info["model"] is None:
+        return float(info["mean_val"])
+
+    tau           = info["lag"]
+    scaler        = info["scaler"]
+    model         = info["model"]
+    max_biz_train = info.get("max_biz_train")
+
+    if hypothetical and "mean_sys_ctx" in info:
+        # Replace live AR features with training-time mean repeated AR_WINDOW times
+        mean_ctx = info["mean_sys_ctx"]
+        ctx = {k: np.full(AR_WINDOW, v) for k, v in mean_ctx.items()}
+    else:
+        ctx = sys_ctx
+
+    X_row = _build_inference_row(biz_hist, ctx, target_key, tau, at_time,
+                                  max_biz_train=max_biz_train)
+
+    X_sc = scaler.transform(X_row) if scaler is not None else X_row
+    pred = float(model.predict(X_sc)[0])
+
+    # ── Extrapolation beyond training range ──────────────────────────────────
+    # All models (GBR, XGBoost, Ridge) can produce wrong extrapolation when
+    # hypothetical=True, because AR features are fixed at mean_sys_ctx which
+    # creates a confounded relationship with biz.
+    # Solution: use biz_only_ridge (trained without AR features) for
+    # hypothetical extrapolation — it has a clean biz→sys relationship.
+    biz_current = biz_hist[-1]
+    if max_biz_train is not None and biz_current > max_biz_train:
+        boundary_pred = info.get("extrap_boundary_pred", pred)
+
+        if hypothetical and info.get("biz_only_ridge") is not None:
+            from app.modules.model_trainer import N_BIZ_FEATURES
+            biz_only_ridge = info["biz_only_ridge"]
+            X_biz_s = X_sc[:, :N_BIZ_FEATURES]
+            ridge_pred_raw = float(biz_only_ridge.predict(X_biz_s)[0])
+            names = ["sin_h","cos_h","sin_d","cos_d","trend",
+                     "bl","bn","d1","d2","bz","bl*sh","bl*ch","above","rel"]
+            feat_str = "  ".join(f"{n}={v:.2f}" for n,v in zip(names, X_biz_s[0]))
+            logger.info("  biz feats scaled: %s", feat_str)
+            logger.info("  coefs: %s", "  ".join(f"{n}={c:.2f}" for n,c in zip(names, biz_only_ridge.coef_)))
+            logger.info("  raw_pred=%.2f  boundary=%.2f", ridge_pred_raw, boundary_pred)
+            ridge_pred = max(ridge_pred_raw, boundary_pred)
+        elif not hypothetical and info.get("extrap_ridge") is not None:
+            extrap_ridge = info["extrap_ridge"]
+            ridge_pred = float(extrap_ridge.predict(X_sc)[0])
+            ridge_pred = max(ridge_pred, boundary_pred)
+        else:
+            ridge_pred = boundary_pred
+
+        # Blend: at boundary → boundary_pred, at 2×max → ridge_pred
+        alpha = min(1.0, (biz_current - max_biz_train) / (max_biz_train + 1e-9))
+        pred  = float(boundary_pred) * (1 - alpha) + float(ridge_pred) * alpha
+        pred  = max(0.0, float(pred))
+
+        logger.info(
+            "  extrap: biz=%.2f > max=%.2f  hyp=%s  alpha=%.2f  "
+            "boundary=%.2f  ridge=%.2f  → pred=%.2f",
+            biz_current, max_biz_train, hypothetical, alpha,
+            boundary_pred, ridge_pred, pred,
+        )
+
+    return float(pred)
+
+
+def _run_inference_v3(
+    artifact: dict,
+    biz_hist: np.ndarray,
+    sys_ctx: dict[str, np.ndarray],
+    at_time: datetime | None = None,
+    hypothetical: bool = False,
+) -> InferencePrediction:
+    """Full v3 inference: five independent models."""
+    pt = artifact["per_target"]
+
+    cpu_pt = round(float(np.clip(_infer_one_target(pt["cpu"],     biz_hist, sys_ctx, "cpu",     at_time, hypothetical), 0, 100)), 2)
+    rgb_pt = round(max(0.0, _infer_one_target(pt["ram_gb"],  biz_hist, sys_ctx, "ram_gb",  at_time, hypothetical)), 2)
+    rpt_pt = round(float(np.clip(_infer_one_target(pt["ram_pct"], biz_hist, sys_ctx, "ram_pct", at_time, hypothetical), 0, 100)), 2)
+    net_pt = round(max(0.0, _infer_one_target(pt["net"],     biz_hist, sys_ctx, "net",     at_time, hypothetical)), 2)
+    dsk_pt = round(float(np.clip(_infer_one_target(pt["disk"],    biz_hist, sys_ctx, "disk",    at_time, hypothetical), 0, 100)), 2)
+
+    # No quantile intervals in v3 (can be added later per target)
+    return InferencePrediction(
+        cpu=         TargetPrediction(point=cpu_pt, lower=None, upper=None),
+        ram_gb=      TargetPrediction(point=rgb_pt, lower=None, upper=None),
+        ram_percent= TargetPrediction(point=rpt_pt, lower=None, upper=None),
+        network=     TargetPrediction(point=net_pt, lower=None, upper=None),
+        disk=        TargetPrediction(point=dsk_pt, lower=None, upper=None),
+    )
+
+
+def _run_inference_legacy(
     artifact: dict,
     business_value: float,
     at_time: datetime | None = None,
 ) -> InferencePrediction:
-    """
-    Run point + quantile inference for all five targets.
-    Percentages clamped [0,100]; GB/Mbps to [0,∞).
-    Intervals enforced: lower <= point <= upper always holds.
-    """
-    scaler      = artifact["scaler"]
-    model_point = artifact["model"]
-    model_lower = artifact.get("model_lower")
-    model_upper = artifact.get("model_upper")
-
-    X        = _build_inference_feature(business_value, at_time)
-    X_scaled = scaler.transform(X)
-
-    pt = model_point.predict(X_scaled)[0]   # shape: (5,)
-    # col: 0=cpu_pct, 1=ram_gb, 2=ram_pct, 3=net_mbps, 4=disk_pct
-    cpu_pt  = round(float(np.clip(pt[0], 0.0, 100.0)), 2)
-    rgb_pt  = round(float(max(0.0, pt[1])), 2)
-    rpt_pt  = round(float(np.clip(pt[2], 0.0, 100.0)), 2)
-    net_pt  = round(float(max(0.0, pt[3])), 2)
-    dsk_pt  = round(float(np.clip(pt[4], 0.0, 100.0)), 2)
-
-    if model_lower is not None and model_upper is not None:
-        lo = model_lower.predict(X_scaled)[0]
-        hi = model_upper.predict(X_scaled)[0]
-
-        def _bounds_pct(lo_v, pt_v, hi_v):
-            return (
-                round(float(np.clip(lo_v, 0.0, pt_v)), 2),
-                round(float(np.clip(hi_v, pt_v, 100.0)), 2),
-            )
-        def _bounds_abs(lo_v, pt_v, hi_v):
-            return (
-                round(float(max(0.0, min(lo_v, pt_v))), 2),
-                round(float(max(pt_v, hi_v)), 2),
-            )
-
-        cpu_lo, cpu_hi = _bounds_pct(lo[0], cpu_pt, hi[0])
-        rgb_lo, rgb_hi = _bounds_abs(lo[1], rgb_pt, hi[1])
-        rpt_lo, rpt_hi = _bounds_pct(lo[2], rpt_pt, hi[2])
-        net_lo, net_hi = _bounds_abs(lo[3], net_pt, hi[3])
-        dsk_lo, dsk_hi = _bounds_pct(lo[4], dsk_pt, hi[4])
-    else:
-        cpu_lo = cpu_hi = rgb_lo = rgb_hi = None
-        rpt_lo = rpt_hi = net_lo = net_hi = dsk_lo = dsk_hi = None
-
+    """Backward-compatible inference for old single-model artifacts."""
+    t    = at_time or datetime.utcnow()
+    hour = t.hour + t.minute / 60.0
+    dow  = t.weekday()
+    X = np.array([[
+        business_value, business_value, 0.0, business_value, 0.0,
+        np.sin(2*np.pi*hour/24), np.cos(2*np.pi*hour/24),
+        np.sin(2*np.pi*dow/7),  np.cos(2*np.pi*dow/7),
+    ]])
+    scaler = artifact["scaler"]
+    model  = artifact["model"]
+    pt     = model.predict(scaler.transform(X))[0]
     return InferencePrediction(
-        cpu=         TargetPrediction(point=cpu_pt, lower=cpu_lo, upper=cpu_hi),
-        ram_gb=      TargetPrediction(point=rgb_pt, lower=rgb_lo, upper=rgb_hi),
-        ram_percent= TargetPrediction(point=rpt_pt, lower=rpt_lo, upper=rpt_hi),
-        network=     TargetPrediction(point=net_pt, lower=net_lo, upper=net_hi),
-        disk=        TargetPrediction(point=dsk_pt, lower=dsk_lo, upper=dsk_hi),
+        cpu=         TargetPrediction(round(float(np.clip(pt[0],0,100)),2), None, None),
+        ram_gb=      TargetPrediction(round(float(max(0,pt[1])),2),        None, None),
+        ram_percent= TargetPrediction(round(float(np.clip(pt[2],0,100)),2),None, None),
+        network=     TargetPrediction(round(float(max(0,pt[3])),2),        None, None),
+        disk=        TargetPrediction(round(float(np.clip(pt[4],0,100)),2),None, None),
     )
 
+
+# ── Public API ────────────────────────────────────────────────────────────────
 
 def forecast(
     db: Session,
     config: ForecastingConfig,
     business_metric_value: float,
+    hypothetical: bool = True,
 ) -> ForecastResult:
+    """Produce and persist a single-step forecast.
+
+    hypothetical=True (default): AR context is replaced with training-time
+    means so the prediction reflects 'what would happen at biz=X' rather
+    than 'what will happen in the next few minutes given the current state'.
+    Set hypothetical=False for short-horizon operational forecasts.
     """
-    Produce and persist a single-step forecast.
-    Includes prediction intervals when the model supports them.
-    """
-    model = get_latest_ready_model(db, config.id)
-    if model is None:
+    model_rec = _get_latest_ready_model(db, config.id)
+    if model_rec is None:
         raise ValueError(
             f"No ready model for config '{config.name}' (id={config.id}). "
             "Train first via POST /configs/{id}/train/."
         )
 
     logger.info(
-        "Forecast: config_id=%d model_id=%d (v%d) biz=%.2f",
-        config.id, model.id, model.version, business_metric_value,
+        "Forecast: config_id=%d model_id=%d (v%d) biz=%.2f hypothetical=%s",
+        config.id, model_rec.id, model_rec.version, business_metric_value, hypothetical,
     )
 
-    artifact = _load_artifact(model)
-    pred     = _run_inference(artifact, business_metric_value)
+    artifact = _load_artifact(model_rec)
+
+    if _is_v3(artifact):
+        if hypothetical:
+            # Fill entire history with current_value so derivative features
+            # (d1, d2, bz, bn) are neutral (0 or 1) — no fake spike artefacts
+            # from inserting a large biz value into a low-biz history.
+            biz_hist = np.full(AR_WINDOW, business_metric_value)
+        else:
+            biz_hist = _fetch_biz_history(config, business_metric_value)
+        sys_ctx  = _fetch_system_context(config)
+        pred     = _run_inference_v3(artifact, biz_hist, sys_ctx,
+                                     hypothetical=hypothetical)
+    else:
+        pred = _run_inference_legacy(artifact, business_metric_value)
 
     result = ForecastResult(
         config_id=config.id,
-        model_id=model.id,
+        model_id=model_rec.id,
         business_metric_value=business_metric_value,
         predicted_cpu_percent=pred.cpu.point,
         predicted_ram_gb=pred.ram_gb.point,
         predicted_ram_percent=pred.ram_percent.point,
         predicted_network_mbps=pred.network.point,
         predicted_disk_io_percent=pred.disk.point,
-        lower_cpu_percent=pred.cpu.lower,
-        lower_ram_gb=pred.ram_gb.lower,
-        lower_ram_percent=pred.ram_percent.lower,
-        lower_network_mbps=pred.network.lower,
-        lower_disk_io_percent=pred.disk.lower,
-        upper_cpu_percent=pred.cpu.upper,
-        upper_ram_gb=pred.ram_gb.upper,
-        upper_ram_percent=pred.ram_percent.upper,
-        upper_network_mbps=pred.network.upper,
-        upper_disk_io_percent=pred.disk.upper,
+        lower_cpu_percent=None, lower_ram_gb=None,
+        lower_ram_percent=None, lower_network_mbps=None,
+        lower_disk_io_percent=None,
+        upper_cpu_percent=None, upper_ram_gb=None,
+        upper_ram_percent=None, upper_network_mbps=None,
+        upper_disk_io_percent=None,
     )
     db.add(result)
     db.commit()
     db.refresh(result)
 
-    has_iv = pred.cpu.lower is not None
     logger.info(
-        "Result: cpu=%.1f%%%s  ram=%.2fGB(%.1f%%)  net=%.1fMbps  disk=%.1f%%",
-        pred.cpu.point,
-        f"(±{round((pred.cpu.upper - pred.cpu.lower) / 2, 1)})" if has_iv else "",
-        pred.ram_gb.point, pred.ram_percent.point,
+        "Result: cpu=%.1f%%  ram=%.2fGB(%.1f%%)  net=%.1fMbps  disk=%.1f%%",
+        pred.cpu.point, pred.ram_gb.point, pred.ram_percent.point,
         pred.network.point, pred.disk.point,
     )
     return result
@@ -213,76 +419,47 @@ def forecast_horizon(
     config: ForecastingConfig,
     steps: list[dict],
 ) -> list[ForecastHorizonResult]:
-    """
-    Produce and persist a multi-step forecast for a schedule of business values.
-
-    Args:
-        steps: list of {"business_metric_value": float, "minutes_ahead": int}
-
-    Returns:
-        List of ForecastHorizonResult rows ordered by step index.
-
-    Raises:
-        ValueError: if no ready model or steps is empty.
-    """
     if not steps:
         raise ValueError("steps list must not be empty.")
 
-    model = get_latest_ready_model(db, config.id)
-    if model is None:
-        raise ValueError(
-            f"No ready model for config '{config.name}' (id={config.id})."
-        )
+    model_rec = _get_latest_ready_model(db, config.id)
+    if model_rec is None:
+        raise ValueError(f"No ready model for config '{config.name}'.")
 
-    artifact = _load_artifact(model)
+    artifact = _load_artifact(model_rec)
+    sys_ctx  = _fetch_system_context(config) if _is_v3(artifact) else {}
     now      = datetime.utcnow()
     results: list[ForecastHorizonResult] = []
-
-    logger.info(
-        "Horizon forecast: config_id=%d model_id=%d %d steps",
-        config.id, model.id, len(steps),
-    )
 
     for i, spec in enumerate(steps):
         biz_val     = float(spec["business_metric_value"])
         minutes_fwd = int(spec["minutes_ahead"])
         at_time     = now + timedelta(minutes=minutes_fwd)
 
-        pred = _run_inference(artifact, biz_val, at_time=at_time)
+        if _is_v3(artifact):
+            biz_hist = _fetch_biz_history(config, biz_val)
+            pred     = _run_inference_v3(artifact, biz_hist, sys_ctx, at_time)
+        else:
+            pred = _run_inference_legacy(artifact, biz_val, at_time)
 
-        row = ForecastHorizonResult(
-            config_id=config.id,
-            model_id=model.id,
-            step=i,
-            minutes_ahead=minutes_fwd,
+        results.append(ForecastHorizonResult(
+            config_id=config.id, model_id=model_rec.id,
+            step=i, minutes_ahead=minutes_fwd,
             business_metric_value=biz_val,
             predicted_cpu_percent=pred.cpu.point,
             predicted_ram_gb=pred.ram_gb.point,
             predicted_ram_percent=pred.ram_percent.point,
             predicted_network_mbps=pred.network.point,
             predicted_disk_io_percent=pred.disk.point,
-            lower_cpu_percent=pred.cpu.lower,
-            lower_ram_gb=pred.ram_gb.lower,
-            lower_ram_percent=pred.ram_percent.lower,
-            lower_network_mbps=pred.network.lower,
-            lower_disk_io_percent=pred.disk.lower,
-            upper_cpu_percent=pred.cpu.upper,
-            upper_ram_gb=pred.ram_gb.upper,
-            upper_ram_percent=pred.ram_percent.upper,
-            upper_network_mbps=pred.network.upper,
-            upper_disk_io_percent=pred.disk.upper,
-        )
-        results.append(row)
+            lower_cpu_percent=None, lower_ram_gb=None,
+            lower_ram_percent=None, lower_network_mbps=None,
+            lower_disk_io_percent=None,
+            upper_cpu_percent=None, upper_ram_gb=None,
+            upper_ram_percent=None, upper_network_mbps=None,
+            upper_disk_io_percent=None,
+        ))
 
     db.add_all(results)
     db.commit()
-    for r in results:
-        db.refresh(r)
-
-    logger.info(
-        "Horizon done: %d steps  cpu range [%.1f%%, %.1f%%]",
-        len(results),
-        min(r.predicted_cpu_percent for r in results),
-        max(r.predicted_cpu_percent for r in results),
-    )
+    for r in results: db.refresh(r)
     return results

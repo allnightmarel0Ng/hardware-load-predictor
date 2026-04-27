@@ -194,4 +194,3 @@ def provision_group_configs(db: Session, group_id: int) -> list[ForecastingConfi
         )
 
     return created
-

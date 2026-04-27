@@ -14,22 +14,17 @@ Implementation — two-method parallel CCF:
      Captures monotonic non-linear relationships (e.g. logarithmic RAM growth)
      and is robust to outliers/load spikes.
 
-Reported strength = max(|pearson_r|, |spearman_r|) at the optimal lag.
-Significance threshold: |r| >= 0.6  (standard convention).
+Step-seconds CV (new):
+  Before running CCF, we select the optimal temporal resolution by resampling
+  the raw 1-minute series at each candidate step size and picking the step
+  that maximises r* for CPU (the most reliable signal). This removes
+  high-frequency noise (e.g. traffic_generator oscillations) that would
+  otherwise destroy cross-correlations on differenced series.
 
-Five targets are analysed independently:
-  cpu, ram_gb, ram_percent, network, disk
-
-Behaviour when correlation is not found (best_r < 0.6):
-  Training is NOT blocked.  The target is flagged as insignificant and its
-  lag is set to 0.  The model will be trained anyway — for a truly
-  uncorrelated target the model learns the mean (R² ≈ 0), which is still a
-  useful baseline (e.g. RAM is often nearly constant regardless of request
-  rate, and "predict mean RAM" is a valid capacity estimate).
-
-  Training is blocked only if the business metric series itself has no
-  variance (std ≈ 0), which indicates a broken PromQL formula or a constant
-  feed — in that case no lag-detection is meaningful.
+  Candidates: 60, 120, 300, 600 seconds (1, 2, 5, 10 minutes).
+  Resampling: block averaging (mean within each window) — same as Prometheus
+  `avg_over_time`.  All six series are resampled identically so alignment
+  is preserved.
 """
 from __future__ import annotations
 
@@ -45,10 +40,14 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-MAX_LAG_MINUTES:      int   = 60    # search window: 0..60 minute lags
-SIGNIFICANCE_THRESHOLD: float = 0.6  # |r| >= 0.6 → significant
-MIN_POINTS:           int   = 30    # minimum aligned points for reliable CCF
-CONSTANT_STD_THRESHOLD: float = 1e-6  # business series is "constant" below this
+MAX_LAG_MINUTES:        int   = 60
+SIGNIFICANCE_THRESHOLD: float = 0.6
+MIN_POINTS:             int   = 10    # after resampling
+CONSTANT_STD_THRESHOLD: float = 1e-6
+
+# Candidate resolutions for CV (in seconds).
+# Data is collected at 60 s; candidates must be multiples of 60.
+STEP_CANDIDATES: tuple[int, ...] = (60, 120, 300, 600)
 
 TargetName = Literal["cpu", "ram_gb", "ram_percent", "network", "disk"]
 ALL_TARGETS: tuple[TargetName, ...] = ("cpu", "ram_gb", "ram_percent", "network", "disk")
@@ -58,41 +57,27 @@ ALL_TARGETS: tuple[TargetName, ...] = ("cpu", "ram_gb", "ram_percent", "network"
 
 @dataclass
 class CorrelationResult:
-    """
-    Holds the discovered lag and correlation coefficients for one
-    (business metric → system metric) pair.
-    """
-    target_metric: str    # "cpu" | "ram_gb" | "ram_percent" | "network" | "disk"
-    lag_minutes:   int    # optimal lag in minutes (0 = no detectable lag)
-    pearson_r:     float  # Pearson CCF at optimal lag  [-1, 1]
-    spearman_r:    float  # Spearman CCF at optimal lag [-1, 1]
-    best_r:        float  # max(|pearson_r|, |spearman_r|) — reported strength
-    is_significant: bool  # True if best_r >= SIGNIFICANCE_THRESHOLD
+    target_metric:  str
+    lag_minutes:    int
+    pearson_r:      float
+    spearman_r:     float
+    best_r:         float
+    is_significant: bool
 
 
 @dataclass
 class CorrelationReport:
-    """
-    CCF results for all five system metric targets.
-
-    Key design decision:
-      any_significant is INFORMATIONAL only — training proceeds regardless.
-      Use per_target_lag() to get the appropriate lag per target;
-      insignificant targets get lag=0 (train on current business value).
-
-      Training is blocked upstream only if the business metric is constant
-      (zero variance) — checked by is_business_constant.
-    """
     cpu:         CorrelationResult
     ram_gb:      CorrelationResult
     ram_percent: CorrelationResult
     network:     CorrelationResult
     disk:        CorrelationResult
     n_points:    int
-    # True if the business metric series itself has effectively zero variance.
-    # This is the only condition that makes training meaningless.
     is_business_constant: bool = False
-    # Computed in __post_init__
+    # Best step size found by CV (seconds)
+    best_step_seconds: int = 60
+    # Base collection resolution (seconds) — passed through for model_trainer
+    _base_step_seconds: int = 60
     any_significant: bool = field(init=False)
 
     def __post_init__(self) -> None:
@@ -102,28 +87,13 @@ class CorrelationReport:
         )
 
     def all_results(self) -> list[CorrelationResult]:
-        """All five results in a consistent order."""
         return [self.cpu, self.ram_gb, self.ram_percent, self.network, self.disk]
 
     def per_target_lag(self) -> dict[str, int]:
-        """
-        Return the best lag per target.
-
-        For significant targets: the discovered lag.
-        For insignificant targets: 0 (train on contemporaneous business value).
-
-        This is the correct input to _build_features when using a single global
-        lag.  For multi-lag training (future work), each target column would
-        use its own lag independently.
-        """
         return {r.target_metric: (r.lag_minutes if r.is_significant else 0)
                 for r in self.all_results()}
 
     def best_lag(self) -> int:
-        """
-        Return the median lag across all significant targets.
-        Falls back to 0 if none are significant (training still proceeds).
-        """
         significant = [r for r in self.all_results() if r.is_significant]
         if not significant:
             return 0
@@ -131,26 +101,120 @@ class CorrelationReport:
         return lags[len(lags) // 2]
 
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
+# ── Resampling ────────────────────────────────────────────────────────────────
+
+def _resample(arr: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Downsample arr by averaging non-overlapping blocks of `factor` elements.
+    Equivalent to avg_over_time in Prometheus.
+    Trailing elements that don't fill a full block are dropped.
+    """
+    if factor <= 1:
+        return arr
+    n_blocks = len(arr) // factor
+    if n_blocks == 0:
+        return arr
+    return arr[: n_blocks * factor].reshape(n_blocks, factor).mean(axis=1)
+
+
+def _resample_bundle(
+    raw: dict[str, np.ndarray],
+    base_step: int,
+    target_step: int,
+) -> dict[str, np.ndarray]:
+    """
+    Resample all six series in `raw` by factor = target_step // base_step.
+    `base_step` is the original collection resolution (seconds).
+    Returns a new dict with all series resampled identically.
+    """
+    factor = max(1, target_step // base_step)
+    return {k: _resample(v, factor) for k, v in raw.items()}
+
+
+# ── Step-seconds CV ───────────────────────────────────────────────────────────
+
+def _score_step(
+    biz: np.ndarray,
+    cpu: np.ndarray,
+    max_lag_steps: int,
+) -> float:
+    """
+    Compute the best r* for the (business → cpu) pair at one resolution.
+    Used to select the optimal step size.
+    CPU is chosen as the pilot metric: it has the most direct causal link
+    to request rate and is least affected by background I/O noise.
+    """
+    if len(biz) < MIN_POINTS or biz.std() < CONSTANT_STD_THRESHOLD:
+        return 0.0
+    biz_d = np.diff(biz)
+    cpu_d = np.diff(cpu)
+    _, p, s = _best_lag_and_coeffs(biz_d, cpu_d, min(max_lag_steps, len(biz_d) - 1))
+    return max(abs(p), abs(s))
+
+
+def _select_best_step(
+    raw: dict[str, np.ndarray],
+    base_step_seconds: int,
+    max_lag_minutes: int,
+) -> int:
+    """
+    CV over STEP_CANDIDATES: pick the step size that yields the highest r*
+    for the business → cpu correlation.
+
+    Args:
+        raw:               dict of raw arrays at base_step_seconds resolution.
+        base_step_seconds: collection resolution of the raw data (seconds).
+        max_lag_minutes:   lag search window in minutes.
+
+    Returns:
+        Best step size in seconds.
+    """
+    best_step  = base_step_seconds
+    best_score = -1.0
+
+    logger.info("Step-seconds CV over candidates %s", STEP_CANDIDATES)
+
+    for step in STEP_CANDIDATES:
+        if step < base_step_seconds:
+            # Can't upsample — skip
+            continue
+
+        resampled  = _resample_bundle(raw, base_step_seconds, step)
+        biz_r      = resampled["biz"]
+        cpu_r      = resampled["cpu"]
+        max_lag_st = max_lag_minutes * 60 // step
+
+        if len(biz_r) < MIN_POINTS:
+            logger.debug("  step=%ds → only %d points, skipping", step, len(biz_r))
+            continue
+
+        score = _score_step(biz_r, cpu_r, max_lag_st)
+        logger.info(
+            "  step=%4ds  n=%4d  r*(biz→cpu)=%.3f",
+            step, len(biz_r), score,
+        )
+
+        if score > best_score:
+            best_score = score
+            best_step  = step
+
+    logger.info(
+        "Best step: %ds (r*=%.3f)", best_step, best_score
+    )
+    return best_step
+
+
+# ── Internal CCF helpers ──────────────────────────────────────────────────────
 
 def _extract_values(series: list[dict]) -> np.ndarray:
     return np.array([p["value"] for p in series], dtype=float)
 
 
 def _first_difference(x: np.ndarray) -> np.ndarray:
-    """
-    Remove non-stationarity by computing first differences x[t] - x[t-1].
-    Result is 1 element shorter than input.
-    """
     return np.diff(x)
 
 
 def _pearson_at_lag(x: np.ndarray, y: np.ndarray, lag: int) -> float:
-    """
-    Pearson correlation between x and y shifted by `lag` steps.
-    x leads y: correlates x[0..n-lag] with y[lag..n].
-    Returns 0.0 for constant series or too-short windows.
-    """
     a, b = (x, y) if lag == 0 else (x[:-lag], y[lag:])
     if len(a) < 2:
         return 0.0
@@ -160,10 +224,6 @@ def _pearson_at_lag(x: np.ndarray, y: np.ndarray, lag: int) -> float:
 
 
 def _spearman_at_lag(x: np.ndarray, y: np.ndarray, lag: int) -> float:
-    """
-    Spearman rank correlation between x and y shifted by `lag` steps.
-    Achieved by rank-transforming the aligned slices then computing Pearson.
-    """
     a, b = (x, y) if lag == 0 else (x[:-lag], y[lag:])
     if len(a) < 2:
         return 0.0
@@ -173,8 +233,7 @@ def _spearman_at_lag(x: np.ndarray, y: np.ndarray, lag: int) -> float:
 
 
 def _rank(x: np.ndarray) -> np.ndarray:
-    """Convert values to 1-based ranks, averaging ties."""
-    temp = np.argsort(x)
+    temp  = np.argsort(x)
     ranks = np.empty_like(temp, dtype=float)
     ranks[temp] = np.arange(1, len(x) + 1, dtype=float)
     i = 0
@@ -194,10 +253,6 @@ def _best_lag_and_coeffs(
     sys: np.ndarray,
     max_lag: int,
 ) -> tuple[int, float, float]:
-    """
-    Sweep lags 0..max_lag and return (best_lag, pearson_r, spearman_r)
-    at the lag that maximises |pearson_r| + |spearman_r|.
-    """
     best_lag      = 0
     best_pearson  = 0.0
     best_spearman = 0.0
@@ -223,13 +278,12 @@ def _analyze_pair(
     target_metric: str,
     max_lag: int,
 ) -> CorrelationResult:
-    """Run the full CCF analysis for one business → system metric pair."""
     lag, pearson_r, spearman_r = _best_lag_and_coeffs(biz_diff, sys_diff, max_lag)
     best_r         = max(abs(pearson_r), abs(spearman_r))
     is_significant = best_r >= SIGNIFICANCE_THRESHOLD
 
     logger.debug(
-        "  %-12s lag=%2d min  pearson=%+.3f  spearman=%+.3f  best=%.3f  sig=%s",
+        "  %-12s lag=%2d  pearson=%+.3f  spearman=%+.3f  best=%.3f  sig=%s",
         target_metric, lag, pearson_r, spearman_r, best_r, is_significant,
     )
     return CorrelationResult(
@@ -247,36 +301,33 @@ def _analyze_pair(
 def analyze(
     bundle: MetricsBundle,
     max_lag: int = MAX_LAG_MINUTES,
+    base_step_seconds: int = 60,
 ) -> CorrelationReport:
     """
     Analyse lag-shifted Pearson + Spearman correlations between the
     business metric and each of the five system metrics.
 
     Steps:
-      1. Check business metric series has non-zero variance (constant = broken).
-      2. First-difference all series (removes trend / non-stationarity).
-      3. For each target, sweep lags 0..max_lag and record the lag that
-         maximises the combined Pearson + Spearman strength.
-      4. Flag significant if best_r >= SIGNIFICANCE_THRESHOLD (0.6).
-
-    Important: insignificant results do NOT block training.
-    The caller should use report.per_target_lag() to pick lag=0 for
-    uncorrelated targets and the discovered lag for correlated ones.
-
-    is_business_constant=True is the only signal that should block training,
-    as it means the business metric feed is broken.
+      1. Check business metric variance (constant = broken config).
+      2. CV over STEP_CANDIDATES to find the resolution with best
+         business → CPU correlation. All series are resampled identically.
+      3. First-difference the resampled series.
+      4. Sweep lags 0..max_lag for each target pair.
+      5. Flag significant if best_r >= 0.6.
 
     Args:
-        bundle:  MetricsBundle from the data collector.
-        max_lag: Maximum lag to search in minutes (default 60).
+        bundle:            MetricsBundle from data_collector.
+        max_lag:           Maximum lag to search in minutes (default 60).
+        base_step_seconds: Resolution at which data was collected (default 60s).
+                           Must match the step_seconds used in fetch_historical_data.
 
     Returns:
-        CorrelationReport with results for all five targets.
+        CorrelationReport with results for all five targets and best_step_seconds.
     """
     n = len(bundle.business)
     logger.info(
-        "Correlation analysis: %d points  max_lag=%d min  targets=%s",
-        n, max_lag, list(ALL_TARGETS),
+        "Correlation analysis: %d raw points  max_lag=%d min  base_step=%ds",
+        n, max_lag, base_step_seconds,
     )
 
     if n < MIN_POINTS:
@@ -285,10 +336,10 @@ def analyze(
             n, MIN_POINTS,
         )
 
-    biz = _extract_values(bundle.business)
+    biz_raw = _extract_values(bundle.business)
 
-    # Detect constant business metric — training would be meaningless
-    biz_std = float(np.std(biz))
+    # Detect constant business metric
+    biz_std     = float(np.std(biz_raw))
     is_constant = biz_std < CONSTANT_STD_THRESHOLD
     if is_constant:
         logger.error(
@@ -297,33 +348,77 @@ def analyze(
             biz_std,
         )
 
-    # First-difference all series
-    biz_d   = _first_difference(biz)
-    cpu_d   = _first_difference(_extract_values(bundle.cpu))
-    rgb_d   = _first_difference(_extract_values(bundle.ram_gb))
-    rpt_d   = _first_difference(_extract_values(bundle.ram_percent))
-    net_d   = _first_difference(_extract_values(bundle.network))
-    dsk_d   = _first_difference(_extract_values(bundle.disk))
+    # Build raw dict for resampling
+    raw = {
+        "biz":     biz_raw,
+        "cpu":     _extract_values(bundle.cpu),
+        "ram_gb":  _extract_values(bundle.ram_gb),
+        "ram_pct": _extract_values(bundle.ram_percent),
+        "net":     _extract_values(bundle.network),
+        "disk":    _extract_values(bundle.disk),
+    }
 
-    # Analyse each pair
-    cpu_res = _analyze_pair(biz_d, cpu_d, "cpu",         max_lag)
-    rgb_res = _analyze_pair(biz_d, rgb_d, "ram_gb",      max_lag)
-    rpt_res = _analyze_pair(biz_d, rpt_d, "ram_percent", max_lag)
-    net_res = _analyze_pair(biz_d, net_d, "network",     max_lag)
-    dsk_res = _analyze_pair(biz_d, dsk_d, "disk",        max_lag)
+    # ── Filter simultaneous idle points before correlation analysis ───────────
+    # Uses max-based threshold (10% of max) — robust when idle ratio is high.
+    # Percentile-based threshold would fail with 80%+ idle data.
+    biz_thr = float(biz_raw.max()) * 0.10
+    cpu_thr = float(raw["cpu"].max()) * 0.10
+    active  = (biz_raw > biz_thr) & (raw["cpu"] > cpu_thr)
+    n_active = int(active.sum())
+    if n_active >= MIN_POINTS:
+        raw_for_corr = {k: v[active] for k, v in raw.items()}
+        logger.info(
+            "Idle filter: kept %d/%d points (biz>%.2f AND cpu>%.2f)",
+            n_active, n, biz_thr, cpu_thr,
+        )
+    else:
+        raw_for_corr = raw
+        logger.warning(
+            "Idle filter: only %d active points after filtering — "
+            "using full dataset for correlation analysis", n_active,
+        )
+
+    # ── Step CV ───────────────────────────────────────────────────────────────
+    best_step = _select_best_step(raw_for_corr, base_step_seconds, max_lag)
+
+    # Resample filtered series at best step for CCF
+    resampled   = _resample_bundle(raw_for_corr, base_step_seconds, best_step)
+    max_lag_st  = max_lag * 60 // best_step   # lag in steps at best resolution
+
+    biz_d   = _first_difference(resampled["biz"])
+    cpu_d   = _first_difference(resampled["cpu"])
+    rgb_d   = _first_difference(resampled["ram_gb"])
+    rpt_d   = _first_difference(resampled["ram_pct"])
+    net_d   = _first_difference(resampled["net"])
+    dsk_d   = _first_difference(resampled["disk"])
+
+    # ── CCF per target ────────────────────────────────────────────────────────
+    cpu_res = _analyze_pair(biz_d, cpu_d, "cpu",         max_lag_st)
+    rgb_res = _analyze_pair(biz_d, rgb_d, "ram_gb",      max_lag_st)
+    rpt_res = _analyze_pair(biz_d, rpt_d, "ram_percent", max_lag_st)
+    net_res = _analyze_pair(biz_d, net_d, "network",     max_lag_st)
+    dsk_res = _analyze_pair(biz_d, dsk_d, "disk",        max_lag_st)
+
+    # Convert lag from steps → minutes
+    step_min = best_step / 60
+    for res in [cpu_res, rgb_res, rpt_res, net_res, dsk_res]:
+        res.lag_minutes = round(res.lag_minutes * step_min)
 
     report = CorrelationReport(
         cpu=cpu_res, ram_gb=rgb_res, ram_percent=rpt_res,
         network=net_res, disk=dsk_res,
-        n_points=n,
+        n_points=len(resampled["biz"]),
         is_business_constant=is_constant,
+        best_step_seconds=best_step,
+        _base_step_seconds=base_step_seconds,
     )
 
     sig_count = sum(1 for r in report.all_results() if r.is_significant)
     logger.info(
-        "Analysis complete: %d/%d targets significant  best_lag=%d min  "
-        "constant_biz=%s",
-        sig_count, len(ALL_TARGETS), report.best_lag(), is_constant,
+        "Analysis complete: %d/%d significant  best_lag=%d min  "
+        "best_step=%ds  constant_biz=%s",
+        sig_count, len(ALL_TARGETS), report.best_lag(),
+        best_step, is_constant,
     )
     for r in report.all_results():
         logger.info(

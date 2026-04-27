@@ -6,6 +6,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.modules import (
     config_manager,
@@ -302,17 +303,248 @@ def train(config_id: int, body: TrainRequest, db: Session = Depends(get_db)):
     )
 
 
+
+
+# ── Per-target quality report builder ────────────────────────────────────────
+
+def _build_per_target_info(model_record, overrides: dict | None = None) -> dict | None:
+    """
+    Build per-target quality report from model parameters and metrics.
+    Uses universal thresholds from the grading specification.
+
+    overrides: optional dict mapping target key → quality metric name,
+               e.g. {"cpu": "mape", "net": "r2"}. When provided, the
+               specified metric is used instead of the auto-selected one.
+               Allowed values: r2 | mape | rel_mae | mae | r2+mape | auto.
+
+    Returns None if model was trained with old schema (no per_target in params).
+    """
+    from app.schemas.schemas import TargetQualityInfo
+
+    params    = model_record.parameters or {}
+    metrics   = model_record.metrics    or {}
+    pt_params = params.get("per_target")
+    if not pt_params:
+        return None
+
+    overrides  = overrides or {}
+    STEP_SECONDS = 300
+
+    # ── Grade functions with exact thresholds from specification ─────────────
+
+    def _grade_cpu(r2, mape):
+        m = mape or 999
+        if r2 is None: return "poor"
+        if r2 >= 0.95 and m <= 5:   return "excellent"
+        if r2 >= 0.85 and m <= 10:  return "good"
+        if r2 >= 0.70 and m <= 15:  return "satisfactory"
+        return "poor"
+
+    def _grade_ram(rel_mae):
+        if rel_mae <= 0.01: return "excellent"
+        if rel_mae <= 0.03: return "good"
+        if rel_mae <= 0.05: return "satisfactory"
+        return "poor"
+
+    def _grade_net(r2, mape):
+        m = mape or 999
+        if r2 is None: return "poor"
+        if r2 >= 0.90 and m <= 10:  return "excellent"
+        if r2 >= 0.75 and m <= 20:  return "good"
+        if r2 >= 0.50 and m <= 30:  return "satisfactory"
+        return "poor"
+
+    def _grade_disk(r2, mape, rel_std):
+        m = mape or 999
+        if r2 is None:
+            # Low variance — use rel_std as proxy for rel_mae
+            if rel_std <= 0.05:  return "excellent"
+            if rel_std <= 0.10:  return "good"
+            if rel_std <= 0.15:  return "satisfactory"
+            return "poor"
+        if r2 >= 0.85 and m <= 15:  return "excellent"
+        if r2 >= 0.65 and m <= 25:  return "good"
+        if r2 >= 0.40 and m <= 40:  return "satisfactory"
+        return "poor"
+
+    # ── Reasoning templates ───────────────────────────────────────────────────
+
+    def _reasoning_cpu(r2, mape, r_star, lag_min, grade):
+        sig = "significant" if r_star >= 0.6 else "weak"
+        lag_str = f"{lag_min} min lag" if lag_min > 0 else "no lag"
+        return (
+            f"CPU is dynamic and directly driven by load. "
+            f"Primary metric: R² (target ≥0.85). "
+            f"Correlation r*={r_star:.3f} ({sig}), {lag_str}. "
+            f"R²={r2:.3f}, MAPE={mape:.1f}% → {grade}."
+        )
+
+    def _reasoning_ram(rel_mae, rel_std, r_star, model_type, grade):
+        reason = (
+            "RAM is inertial and low-variance (rel_std={:.4f} < 0.05). "
+            if rel_std < 0.05 else
+            "RAM is inertial; R² is unreliable for low-variance series. "
+        ).format(rel_std)
+        return (
+            reason +
+            f"Primary metric: rel_mae = MAE/mean (target ≤0.05). "
+            f"Correlation r*={r_star:.3f}. "
+            f"Model: {model_type}. rel_mae≈{rel_mae:.4f} → {grade}."
+        )
+
+    def _reasoning_net(r2, mape, r_star, lag_min, grade):
+        sig = "significant" if r_star >= 0.6 else "weak"
+        lag_str = f"{lag_min} min lag" if lag_min > 0 else "no lag"
+        return (
+            f"Network is moderately dynamic with potential spikes. "
+            f"Primary metrics: R² (target ≥0.75) + MAPE (target ≤20%). "
+            f"Correlation r*={r_star:.3f} ({sig}), {lag_str}. "
+            f"R²={r2:.3f}, MAPE={mape:.1f}% → {grade}."
+        )
+
+    def _reasoning_disk(r2, mape, r_star, rel_std, grade):
+        sig = "significant" if r_star >= 0.6 else "weak (disk weakly coupled to business)"
+        if r2 is None:
+            return (
+                f"Disk is inertial (rel_std={rel_std:.4f}); mean_baseline used. "
+                f"Correlation r*={r_star:.3f} ({sig}). "
+                f"rel_std used as quality proxy → {grade}."
+            )
+        return (
+            f"Disk is inertial with slow changes. "
+            f"Primary metrics: R² (target ≥0.65) + MAPE (target ≤25%). "
+            f"Correlation r*={r_star:.3f} ({sig}). "
+            f"R²={r2:.3f}, MAPE={mape:.1f}% → {grade}."
+        )
+
+    # ── Build per-target report ───────────────────────────────────────────────
+
+    result = {}
+    for key in ("cpu", "ram_gb", "ram_pct", "net", "disk"):
+        info    = pt_params.get(key, {})
+        lag     = info.get("lag", 0)
+        r_star  = info.get("r_star", 0.0)
+        rel_std = info.get("rel_std", 0.0)
+        mtype   = info.get("model_type", "unknown")
+
+        r2   = metrics.get(f"r2_{key}")
+        mae  = metrics.get(f"mae_{key}")
+        mape = metrics.get(f"mape_{key}")
+        lag_min = lag * STEP_SECONDS // 60
+
+        # Compute rel_mae from stored mae and mean_val if available
+        mean_val = info.get("mean_val")
+        if mae is not None and mean_val and mean_val > 1e-9:
+            rel_mae_val = round(mae / mean_val, 4)
+        else:
+            rel_mae_val = round(rel_std, 4)   # fallback approximation
+
+        # Select primary metric — respect explicit override if provided
+        is_low_variance = rel_std < 0.05
+        override_metric = overrides.get(key, "auto")
+        # Resolve "auto" to the nature-based default
+        if override_metric == "auto" or not override_metric:
+            if key == "cpu":
+                override_metric = "r2"
+            elif key in ("ram_gb", "ram_pct") or is_low_variance:
+                override_metric = "rel_mae"
+            elif key == "net":
+                override_metric = "r2+mape"
+            else:
+                override_metric = "r2+mape"
+
+        # Apply the chosen (or overridden) metric
+        if override_metric == "r2":
+            quality_metric = "r2"
+            quality_value  = round(r2, 4) if r2 is not None else 0.0
+            grade          = _grade_cpu(r2, mape)
+            reasoning      = _reasoning_cpu(r2 or 0, mape or 0, r_star, lag_min, grade)
+            if override_metric != ("r2" if key == "cpu" else "auto"):
+                reasoning = f"[Override: r2 requested] " + reasoning
+
+        elif override_metric == "rel_mae":
+            quality_metric = "rel_mae"
+            quality_value  = rel_mae_val
+            grade          = _grade_ram(rel_mae_val)
+            reasoning      = _reasoning_ram(rel_mae_val, rel_std, r_star, mtype, grade)
+            if key not in ("ram_gb", "ram_pct") and not is_low_variance:
+                reasoning = f"[Override: rel_mae requested] " + reasoning
+
+        elif override_metric == "mape":
+            quality_metric = "mape"
+            quality_value  = round(mape, 4) if mape is not None else 0.0
+            # Use CPU thresholds for mape standalone grading
+            if mape is None:     grade = "poor"
+            elif mape <= 5:      grade = "excellent"
+            elif mape <= 10:     grade = "good"
+            elif mape <= 15:     grade = "satisfactory"
+            else:                grade = "poor"
+            reasoning = (
+                f"[Override: mape requested] r*={r_star:.3f}, "
+                f"MAPE={mape:.2f}% → {grade}."
+            )
+
+        elif override_metric == "mae":
+            quality_metric = "mae"
+            quality_value  = round(mae, 4) if mae is not None else 0.0
+            grade = "good"   # MAE has no universal threshold — always informational
+            reasoning = (
+                f"[Override: mae requested — no universal threshold] "
+                f"r*={r_star:.3f}, MAE={mae:.4f}."
+            )
+
+        else:   # r2+mape (default for net/disk, or explicit override)
+            quality_metric = "r2+mape"
+            quality_value  = round(r2, 4) if r2 is not None else rel_std
+            if key == "net":
+                grade     = _grade_net(r2, mape)
+                reasoning = _reasoning_net(r2 or 0, mape or 0, r_star, lag_min, grade)
+            else:
+                grade     = _grade_disk(r2, mape, rel_std)
+                reasoning = _reasoning_disk(r2, mape or 0, r_star, rel_std, grade)
+            if override_metric == "r2+mape" and key not in ("net", "disk"):
+                reasoning = f"[Override: r2+mape requested] " + reasoning
+
+        result[key] = TargetQualityInfo(
+            lag_steps      = lag,
+            lag_minutes    = lag_min,
+            r_star         = round(r_star, 3),
+            rel_std        = round(rel_std, 4),
+            model_type     = mtype,
+            quality_metric = quality_metric,
+            quality_value  = quality_value,
+            grade          = grade,
+            quality_reasoning = reasoning,
+            r2      = round(r2,          4) if r2      is not None else None,
+            mae     = round(mae,         4) if mae     is not None else None,
+            mape    = round(mape,        4) if mape    is not None else None,
+            rel_mae = rel_mae_val,
+        )
+    return result
+
+
+def _enrich_model(model_record, config=None):
+    """Attach per_target quality info to a TrainedModel ORM object for serialisation."""
+    overrides = getattr(config, "quality_metric_overrides", None) if config else None
+    model_record.per_target = _build_per_target_info(model_record, overrides=overrides)
+    return model_record
+
 @train_router.get("/models", response_model=list[TrainedModelRead])
 def list_models(config_id: int, db: Session = Depends(get_db)):
-    """List all trained models for a config, newest first."""
-    config_manager.get_config(db, config_id)  # 404 guard
+    """List all trained models for a config, newest first.
+
+    Quality metrics are graded using the thresholds from the universal
+    specification. Override the primary metric per target by setting
+    quality_metric_overrides on the config (PATCH /configs/{id}).
+    """
+    config = config_manager.get_config(db, config_id)
     models = (
         db.query(model_trainer.TrainedModel)
         .filter_by(config_id=config_id)
         .order_by(model_trainer.TrainedModel.version.desc())
         .all()
     )
-    return models
+    return [_enrich_model(m, config=config) for m in models]
 
 
 @train_router.get("/jobs", response_model=list[TrainJobRead])
@@ -507,9 +739,10 @@ def train(config_id: int, body: TrainRequest, db: Session = Depends(get_db)):
         business_formula=config.business_metric_formula,
         lookback_days=body.lookback_days,
         instance_label=instance_label,
+        step_seconds=settings.step_seconds,
     )
 
-    report = correlation_analyzer.analyze(bundle)
+    report = correlation_analyzer.analyze(bundle, base_step_seconds=settings.step_seconds)
     if report.is_business_constant:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

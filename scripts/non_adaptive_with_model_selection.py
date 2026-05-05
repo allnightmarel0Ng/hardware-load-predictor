@@ -30,7 +30,7 @@ STEP_SECONDS = 300
 TRUE_LAG = 1
 SIGNIFICANCE = 0.6
 LOOKBACK = 30
-TRAIN_RATIO = 0.8          # для временного разделения при поиске лагов
+TRAIN_RATIO = 0.8
 MAX_LAG = 20
 REL_STD_THRESHOLD = 0.05
 
@@ -137,10 +137,6 @@ def pattern_multimodal(cpu: np.ndarray, lag: int) -> np.ndarray:
     return np.clip(base * scale + RNG.normal(0, 1, n), 0.5, 300)
 
 def pattern_long_spiky(cpu: np.ndarray, lag: int) -> np.ndarray:
-    """
-    Паттерн: долгий простой (почти нулевая активность), затем резкий скачок
-    и длительное удержание на высоком уровне.
-    """
     n = len(cpu)
     base = _cpu_to_proxy(cpu, lag, coeff=0.8)
     # Порог: первые 70% времени – низкие значения, затем 30% – высокие
@@ -203,8 +199,6 @@ def find_lag_and_corr(biz: np.ndarray, sys: np.ndarray, max_lag: int = MAX_LAG) 
 
 def build_features_full(biz: np.ndarray, ds: Dict[str, np.ndarray], tau: int,
                         max_biz_train: Optional[float] = None) -> np.ndarray:
-    """Всегда используем полные бизнес-признаки (сдвиг, нормализация, разности, z-score, взаимодействия).
-       Если задан max_biz_train, добавляется признак biz_above_max = max(0, biz[i] - max_biz_train)."""
     n = ds["n"]
     rows = []
     for i in range(LOOKBACK, n - 1):
@@ -225,7 +219,6 @@ def build_features_full(biz: np.ndarray, ds: Dict[str, np.ndarray], tau: int,
         bz = (biz[i] - mu5) / (biz[max(0, i-5):i].std() + 1e-9)
         biz_feats = [bl, bn, d1, d2, bz, bl * sin_h, bl * cos_h]
 
-        # Добавляем признак превышения максимального значения бизнес-метрики в обучении
         if max_biz_train is not None:
             biz_above = max(0, biz[i] - max_biz_train)
             biz_feats.append(biz_above)
@@ -250,11 +243,6 @@ def build_features_full(biz: np.ndarray, ds: Dict[str, np.ndarray], tau: int,
     return X
 
 def select_model_and_metric(r: float, rel_std: float, extrapolate: bool = False) -> Tuple[str, str, Optional[float], List]:
-    """
-    Возвращает: (model_type, eval_metric, success_threshold, param_grid)
-    Для экстраполяционного режима (extrapolate=True) меняем логику для low variance:
-      - даже при rel_std < REL_STD_THRESHOLD используем ridge вместо mean_baseline.
-    """
     if not extrapolate and rel_std < REL_STD_THRESHOLD:
         return 'mean_baseline', 'rel_mae', 0.05, [{}]
 
@@ -343,8 +331,6 @@ def run_non_adaptive(ds: Dict[str, np.ndarray], label: str, biz_fn: Callable, la
     if extrapolate:
         print(f"  EXTRAPOLATION MODE: train on points with biz < {extrapolate_threshold*100:.0f}% of max(biz_train)")
 
-    # Для каждого таргета определяем лаг, r*, rel_std
-    # Шапка таблицы зависит от режима
     if extrapolate:
         print("\n  Target   |  lag  |   r*   | model      | metric  | Train R² | Test R²  |  MAE_test | MAPE_test")
         print("  ---------+-------+--------+------------+---------+----------+----------+-----------+----------")
@@ -365,15 +351,12 @@ def run_non_adaptive(ds: Dict[str, np.ndarray], label: str, biz_fn: Callable, la
         model_type, eval_metric, threshold, param_grid = select_model_and_metric(r, rel_std, extrapolate=extrapolate)
 
         if extrapolate:
-            # Строим признаки для всей выборки, но сначала нужно вычислить max_biz_train на обучающих точках (первые 80% по времени)
-            # Для этого получим текущие значения biz для индексов i (от LOOKBACK до n-2)
             indices = np.arange(LOOKBACK, n-1)
             biz_current = biz[indices]
             split_idx = int(TRAIN_RATIO * len(biz_current))
             max_biz_train = np.max(biz_current[:split_idx])
             biz_threshold = extrapolate_threshold * max_biz_train
 
-            # Строим признаки с признаком превышения (max_biz_train)
             X_full = build_features_full(biz, ds, lag, max_biz_train=max_biz_train)
             y_full = ds[key][LOOKBACK:n-1]
 
@@ -388,7 +371,6 @@ def run_non_adaptive(ds: Dict[str, np.ndarray], label: str, biz_fn: Callable, la
             X_test = X_full[test_mask]
             y_test = y_full[test_mask]
 
-            # Обучаем модель на train (без временного CV, так как уже разделили по biz)
             if model_type == 'mean_baseline':
                 pred_test = np.full_like(y_test, y_train.mean())
                 pred_train = np.full_like(y_train, y_train.mean())

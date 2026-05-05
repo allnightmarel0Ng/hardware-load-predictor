@@ -1,4 +1,3 @@
-"""Unit tests for Module 1 — Configuration Manager."""
 import pytest
 from fastapi import HTTPException
 
@@ -12,8 +11,6 @@ from app.modules.config_manager import (
 from app.schemas.schemas import ForecastingConfigCreate, ForecastingConfigUpdate
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
-
 def _make_config(name: str = "test-config") -> ForecastingConfigCreate:
     return ForecastingConfigCreate(
         name=name,
@@ -23,8 +20,6 @@ def _make_config(name: str = "test-config") -> ForecastingConfigCreate:
         business_metric_formula="sum(rate(orders_total[1m]))",
     )
 
-
-# ── tests ─────────────────────────────────────────────────────────────────────
 
 class TestCreateConfig:
     def test_creates_and_returns_config(self, db):

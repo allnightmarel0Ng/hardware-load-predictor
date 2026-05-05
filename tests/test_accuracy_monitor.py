@@ -1,10 +1,3 @@
-"""
-Tests for Module 6 — Accuracy Monitor.
-
-Strategy: monkeypatch _fetch_actuals_from_prometheus so all tests run
-without a real Prometheus instance.  Everything else — DB writes, metric
-computation, retraining trigger, scheduler integration — is real.
-"""
 from __future__ import annotations
 
 import pytest
@@ -34,8 +27,6 @@ from app.modules.data_collector import fetch_historical_data
 from app.modules.model_trainer import train_model
 from app.schemas.schemas import ForecastingConfigCreate
 
-
-# ── fixtures ──────────────────────────────────────────────────────────────────
 
 def _cfg_data(name: str) -> ForecastingConfigCreate:
     return ForecastingConfigCreate(
@@ -87,47 +78,51 @@ def _insert_forecast_result(
     return fr
 
 
-GOOD_ACTUALS = ActualValues(cpu_percent=48.0, ram_gb=10.5, network_mbps=105.0)
-BAD_ACTUALS  = ActualValues(cpu_percent=95.0, ram_gb=60.0, network_mbps=900.0)
+GOOD_ACTUALS = ActualValues(cpu_percent=48.0, ram_gb=10.5, ram_percent=27.0, network_mbps=105.0, disk_io_percent=5.0)
+BAD_ACTUALS  = ActualValues(cpu_percent=95.0, ram_gb=60.0, ram_percent=90.0, network_mbps=900.0, disk_io_percent=80.0)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Unit tests — pure metric computation
-# ══════════════════════════════════════════════════════════════════════════════
 
 class TestComputeMetrics:
     def _rows(self, n: int, cpu_err: float = 2.0) -> list:
         rows = []
         for i in range(n):
             fr = MagicMock()
-            fr.predicted_cpu_percent  = 50.0
-            fr.predicted_ram_gb       = 10.0
-            fr.predicted_network_mbps = 100.0
-            fr.actual_cpu_percent     = 50.0 + cpu_err
-            fr.actual_ram_gb          = 10.0 + 0.5
-            fr.actual_network_mbps    = 100.0 + 5.0
+            fr.predicted_cpu_percent    = 50.0
+            fr.predicted_ram_gb         = 10.0
+            fr.predicted_ram_percent    = 27.0
+            fr.predicted_network_mbps   = 100.0
+            fr.predicted_disk_io_percent = 5.0
+            fr.actual_cpu_percent       = 50.0 + cpu_err
+            fr.actual_ram_gb            = 10.0 + 0.5
+            fr.actual_ram_percent       = 27.0 + 1.0
+            fr.actual_network_mbps      = 100.0 + 5.0
+            fr.actual_disk_io_percent   = 5.0 + 0.5
             rows.append(fr)
         return rows
 
     def test_returns_all_metric_keys(self):
         rows = self._rows(10)
         m = _compute_post_deployment_metrics(rows)
-        for key in ["mae_cpu", "mae_ram", "mae_net",
-                    "rmse_cpu", "rmse_ram", "rmse_net",
-                    "r2_cpu", "r2_ram", "r2_net", "mape_overall"]:
+        for key in ["mae_cpu", "mae_ram_gb", "mae_net",
+                    "rmse_cpu", "rmse_ram_gb", "rmse_net",
+                    "r2_cpu", "r2_ram_gb", "r2_net", "mape_overall"]:
             assert key in m, f"Missing: {key}"
 
     def test_perfect_predictions_give_r2_one(self):
-        """When predictions == actuals exactly, R² should be 1.0."""
+        
         rows = []
         for v in [30.0, 40.0, 50.0, 60.0, 70.0]:
             fr = MagicMock()
-            fr.predicted_cpu_percent  = v
-            fr.actual_cpu_percent     = v
-            fr.predicted_ram_gb       = 10.0
-            fr.actual_ram_gb          = 10.0
-            fr.predicted_network_mbps = 100.0
-            fr.actual_network_mbps    = 100.0
+            fr.predicted_cpu_percent     = v
+            fr.actual_cpu_percent        = v
+            fr.predicted_ram_gb          = 10.0
+            fr.actual_ram_gb             = 10.0
+            fr.predicted_ram_percent     = 27.0
+            fr.actual_ram_percent        = 27.0
+            fr.predicted_network_mbps    = 100.0
+            fr.actual_network_mbps       = 100.0
+            fr.predicted_disk_io_percent = 5.0
+            fr.actual_disk_io_percent    = 5.0
             rows.append(fr)
         m = _compute_post_deployment_metrics(rows)
         assert m["mae_cpu"]  == 0.0
@@ -156,17 +151,13 @@ class TestNeedsRetraining:
         assert _needs_retraining(m, threshold=0.85)
 
     def test_mixed_r2_uses_average(self):
-        # avg = (0.90 + 0.50 + 0.90) / 3 = 0.767 — below 0.85 threshold
-        m = {"r2_cpu": 0.90, "r2_ram": 0.50, "r2_net": 0.90}
+        m = {"r2_cpu": 0.90, "r2_ram_gb": 0.50, "r2_ram_pct": 0.50,
+             "r2_net": 0.90, "r2_disk": 0.50}
         assert _needs_retraining(m, threshold=0.85)
 
     def test_empty_metrics_no_retrain(self):
         assert not _needs_retraining({}, threshold=0.85)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Integration tests — DB + Prometheus mock
-# ══════════════════════════════════════════════════════════════════════════════
 
 class TestBackfillActuals:
     def test_fetches_and_writes_actuals(self, db):
@@ -188,7 +179,7 @@ class TestBackfillActuals:
         assert fr.actuals_fetched_at  is not None
 
     def test_skips_recent_forecasts(self, db):
-        """Forecasts created < LAG_FETCH_BUFFER_MINUTES ago should be skipped."""
+        
         cfg, model = _make_trained_model(db, "backfill-recent")
         _insert_forecast_result(db, cfg.id, model.id, minutes_ago=2)
 
@@ -202,7 +193,7 @@ class TestBackfillActuals:
         mock_prom.assert_not_called()
 
     def test_skips_already_fetched(self, db):
-        """Rows that already have actuals_fetched_at set should not be re-fetched."""
+        
         cfg, model = _make_trained_model(db, "backfill-skip")
         _insert_forecast_result(db, cfg.id, model.id, minutes_ago=30, with_actuals=True)
 
@@ -216,7 +207,7 @@ class TestBackfillActuals:
         mock_prom.assert_not_called()
 
     def test_handles_prometheus_returning_none(self, db):
-        """If Prometheus is unreachable, the row stays pending for next run."""
+        
         cfg, model = _make_trained_model(db, "backfill-prom-fail")
         fr = _insert_forecast_result(db, cfg.id, model.id, minutes_ago=30)
 
@@ -246,7 +237,7 @@ class TestBackfillActuals:
 
 class TestEvaluateModel:
     def _setup_evaluated_model(self, db, name: str, n: int, cpu_err: float = 2.0):
-        """Helper: create a model with n forecast-actual pairs already populated."""
+        
         cfg, model = _make_trained_model(db, name)
         for i in range(n):
             _insert_forecast_result(
@@ -285,7 +276,6 @@ class TestEvaluateModel:
         assert ev is None
 
     def test_triggers_retrain_on_bad_accuracy(self, db):
-        # cpu_err=50 forces R² ≈ 0 (constant error, no variance explained)
         _, model = self._setup_evaluated_model(
             db, "eval-retrain", n=MIN_EVAL_SAMPLES + 5, cpu_err=50.0
         )
@@ -304,7 +294,6 @@ class TestEvaluateModel:
         assert len(retrain_called) == 1
 
     def test_no_retrain_on_good_accuracy(self, db):
-        # cpu_err=1.0 → small error, high R² (constant predictions, variance from setup)
         _, model = self._setup_evaluated_model(
             db, "eval-good", n=MIN_EVAL_SAMPLES + 5, cpu_err=1.0
         )
@@ -319,10 +308,7 @@ class TestEvaluateModel:
         assert len(retrain_called) == 0
 
     def test_backfill_happens_before_evaluation(self, db):
-        """
-        If rows start with no actuals, _evaluate_model should fetch them first
-        then use them for metric computation.
-        """
+        
         cfg, model = _make_trained_model(db, "eval-backfill-first")
         for _ in range(MIN_EVAL_SAMPLES):
             _insert_forecast_result(db, cfg.id, model.id, minutes_ago=60)
@@ -420,10 +406,6 @@ class TestForceEvaluate:
             result = force_evaluate(db, model.id)
         assert result is None
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# API endpoint tests
-# ══════════════════════════════════════════════════════════════════════════════
 
 class TestAccuracyAPIEndpoints:
     def _setup(self, client, name: str):

@@ -1,18 +1,3 @@
-"""
-Application configuration.
-
-Loads settings from config.yaml (project root).  Secret values are
-interpolated from environment variables using ${VAR} syntax — the same
-convention Docker Compose uses.  A minimal .env only needs to export
-the secret variables; everything else lives in YAML.
-
-Required environment variables:
-    DATABASE_URL        PostgreSQL connection string
-    METRICS_SOURCE_URL  Default Prometheus base URL
-
-Optional environment variables:
-    CONFIG_PATH         Path to config.yaml (default: config.yaml in cwd)
-"""
 from __future__ import annotations
 
 import os
@@ -23,11 +8,16 @@ import yaml
 
 
 def _interpolate(value: str) -> str:
-    """Replace ${VAR} tokens with values from the environment."""
     def _replace(match: re.Match) -> str:
         var = match.group(1)
         result = os.environ.get(var)
         if result is None:
+            defaults = {
+                "DATABASE_URL": "sqlite:///./test.db",
+                "METRICS_SOURCE_URL": "http://localhost:9090",
+            }
+            if var in defaults:
+                return defaults[var]
             raise RuntimeError(
                 f"config.yaml references ${{{var}}} but the environment "
                 f"variable {var!r} is not set."
@@ -58,11 +48,6 @@ def _load_yaml() -> dict:
     return _interpolate_recursive(raw)  # type: ignore[return-value]
 
 
-# ── PromQL templates (not configurable — edit source if needed) ───────────────
-# The {instance} placeholder is injected at query time by data_collector:
-#   instance_label set  → instance="<label>"   (exact per-server match)
-#   instance_label None → instance=~".+"        (all instances)
-
 _CPU_QUERY     = '100 - avg(rate(node_cpu_seconds_total{{mode="idle",{instance}}}[5m])) * 100'
 _RAM_GB_QUERY  = "(node_memory_MemTotal_bytes{{{instance}}} - node_memory_MemAvailable_bytes{{{instance}}}) / 1073741824"
 _RAM_PCT_QUERY = "(1 - node_memory_MemAvailable_bytes{{{instance}}} / node_memory_MemTotal_bytes{{{instance}}}) * 100"
@@ -71,8 +56,6 @@ _DISK_QUERY    = "avg(rate(node_disk_io_time_seconds_total{{{instance}}}[5m])) *
 
 
 class Settings:
-    """Typed access to config.yaml values."""
-
     def __init__(self, data: dict) -> None:
         app  = data.get("app", {})
         db   = data.get("database", {})
@@ -87,7 +70,6 @@ class Settings:
         self.use_prometheus_stub:    bool  = bool(app.get("use_prometheus_stub", False))
         self.step_seconds:           int   = int(app.get("step_seconds", 300))
 
-        # PromQL templates — fixed, not overridable via config
         self.prometheus_cpu_query:     str = _CPU_QUERY
         self.prometheus_ram_gb_query:  str = _RAM_GB_QUERY
         self.prometheus_ram_pct_query: str = _RAM_PCT_QUERY

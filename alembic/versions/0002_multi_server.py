@@ -1,9 +1,3 @@
-"""add server_groups and servers tables
-
-Revision ID: 0002_multi_server
-Revises: 0001_initial
-Create Date: 2026-03-30
-"""
 from typing import Sequence, Union
 
 import sqlalchemy as sa
@@ -16,7 +10,6 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # ── server_groups ─────────────────────────────────────────────────────────
     op.create_table(
         "server_groups",
         sa.Column("id",                       sa.Integer(),    nullable=False),
@@ -33,7 +26,6 @@ def upgrade() -> None:
     )
     op.create_index("ix_server_groups_id", "server_groups", ["id"])
 
-    # ── servers ───────────────────────────────────────────────────────────────
     op.create_table(
         "servers",
         sa.Column("id",         sa.Integer(),    nullable=False),
@@ -50,7 +42,6 @@ def upgrade() -> None:
     op.create_index("ix_servers_id",       "servers", ["id"])
     op.create_index("ix_servers_group_id", "servers", ["group_id"])
 
-    # ── add server_id FK to forecasting_configs ───────────────────────────────
     op.add_column(
         "forecasting_configs",
         sa.Column("server_id", sa.Integer(), nullable=True),

@@ -1,31 +1,3 @@
-"""
-Module 3 — Correlation Analyzer
-Identifies the time lag at which a business metric best predicts each
-system metric, and quantifies the strength of that relationship.
-
-Implementation — two-method parallel CCF:
-
-  1. Pearson cross-correlation function (CCF) swept over lags 0..MAX_LAG.
-     Fast (O(n log n) via FFT convolution), gives signed linear correlation.
-     Series are first-differenced before CCF to remove trend/non-stationarity,
-     preventing spurious correlations from shared drifts.
-
-  2. Spearman rank CCF swept in parallel.
-     Captures monotonic non-linear relationships (e.g. logarithmic RAM growth)
-     and is robust to outliers/load spikes.
-
-Step-seconds CV (new):
-  Before running CCF, we select the optimal temporal resolution by resampling
-  the raw 1-minute series at each candidate step size and picking the step
-  that maximises r* for CPU (the most reliable signal). This removes
-  high-frequency noise (e.g. traffic_generator oscillations) that would
-  otherwise destroy cross-correlations on differenced series.
-
-  Candidates: 60, 120, 300, 600 seconds (1, 2, 5, 10 minutes).
-  Resampling: block averaging (mean within each window) — same as Prometheus
-  `avg_over_time`.  All six series are resampled identically so alignment
-  is preserved.
-"""
 from __future__ import annotations
 
 import logging
@@ -38,22 +10,17 @@ from app.modules.data_collector import MetricsBundle
 
 logger = logging.getLogger(__name__)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
 
 MAX_LAG_MINUTES:        int   = 60
 SIGNIFICANCE_THRESHOLD: float = 0.6
 MIN_POINTS:             int   = 10    # after resampling
 CONSTANT_STD_THRESHOLD: float = 1e-6
 
-# Candidate resolutions for CV (in seconds).
-# Data is collected at 60 s; candidates must be multiples of 60.
 STEP_CANDIDATES: tuple[int, ...] = (60, 120, 300, 600)
 
 TargetName = Literal["cpu", "ram_gb", "ram_percent", "network", "disk"]
 ALL_TARGETS: tuple[TargetName, ...] = ("cpu", "ram_gb", "ram_percent", "network", "disk")
 
-
-# ── Public data types ─────────────────────────────────────────────────────────
 
 @dataclass
 class CorrelationResult:
@@ -74,9 +41,7 @@ class CorrelationReport:
     disk:        CorrelationResult
     n_points:    int
     is_business_constant: bool = False
-    # Best step size found by CV (seconds)
     best_step_seconds: int = 60
-    # Base collection resolution (seconds) — passed through for model_trainer
     _base_step_seconds: int = 60
     any_significant: bool = field(init=False)
 
@@ -101,14 +66,7 @@ class CorrelationReport:
         return lags[len(lags) // 2]
 
 
-# ── Resampling ────────────────────────────────────────────────────────────────
-
 def _resample(arr: np.ndarray, factor: int) -> np.ndarray:
-    """
-    Downsample arr by averaging non-overlapping blocks of `factor` elements.
-    Equivalent to avg_over_time in Prometheus.
-    Trailing elements that don't fill a full block are dropped.
-    """
     if factor <= 1:
         return arr
     n_blocks = len(arr) // factor
@@ -122,28 +80,15 @@ def _resample_bundle(
     base_step: int,
     target_step: int,
 ) -> dict[str, np.ndarray]:
-    """
-    Resample all six series in `raw` by factor = target_step // base_step.
-    `base_step` is the original collection resolution (seconds).
-    Returns a new dict with all series resampled identically.
-    """
     factor = max(1, target_step // base_step)
     return {k: _resample(v, factor) for k, v in raw.items()}
 
-
-# ── Step-seconds CV ───────────────────────────────────────────────────────────
 
 def _score_step(
     biz: np.ndarray,
     cpu: np.ndarray,
     max_lag_steps: int,
 ) -> float:
-    """
-    Compute the best r* for the (business → cpu) pair at one resolution.
-    Used to select the optimal step size.
-    CPU is chosen as the pilot metric: it has the most direct causal link
-    to request rate and is least affected by background I/O noise.
-    """
     if len(biz) < MIN_POINTS or biz.std() < CONSTANT_STD_THRESHOLD:
         return 0.0
     biz_d = np.diff(biz)
@@ -157,18 +102,6 @@ def _select_best_step(
     base_step_seconds: int,
     max_lag_minutes: int,
 ) -> int:
-    """
-    CV over STEP_CANDIDATES: pick the step size that yields the highest r*
-    for the business → cpu correlation.
-
-    Args:
-        raw:               dict of raw arrays at base_step_seconds resolution.
-        base_step_seconds: collection resolution of the raw data (seconds).
-        max_lag_minutes:   lag search window in minutes.
-
-    Returns:
-        Best step size in seconds.
-    """
     best_step  = base_step_seconds
     best_score = -1.0
 
@@ -176,7 +109,6 @@ def _select_best_step(
 
     for step in STEP_CANDIDATES:
         if step < base_step_seconds:
-            # Can't upsample — skip
             continue
 
         resampled  = _resample_bundle(raw, base_step_seconds, step)
@@ -203,8 +135,6 @@ def _select_best_step(
     )
     return best_step
 
-
-# ── Internal CCF helpers ──────────────────────────────────────────────────────
 
 def _extract_values(series: list[dict]) -> np.ndarray:
     return np.array([p["value"] for p in series], dtype=float)
@@ -296,34 +226,11 @@ def _analyze_pair(
     )
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
-
 def analyze(
     bundle: MetricsBundle,
     max_lag: int = MAX_LAG_MINUTES,
     base_step_seconds: int = 60,
 ) -> CorrelationReport:
-    """
-    Analyse lag-shifted Pearson + Spearman correlations between the
-    business metric and each of the five system metrics.
-
-    Steps:
-      1. Check business metric variance (constant = broken config).
-      2. CV over STEP_CANDIDATES to find the resolution with best
-         business → CPU correlation. All series are resampled identically.
-      3. First-difference the resampled series.
-      4. Sweep lags 0..max_lag for each target pair.
-      5. Flag significant if best_r >= 0.6.
-
-    Args:
-        bundle:            MetricsBundle from data_collector.
-        max_lag:           Maximum lag to search in minutes (default 60).
-        base_step_seconds: Resolution at which data was collected (default 60s).
-                           Must match the step_seconds used in fetch_historical_data.
-
-    Returns:
-        CorrelationReport with results for all five targets and best_step_seconds.
-    """
     n = len(bundle.business)
     logger.info(
         "Correlation analysis: %d raw points  max_lag=%d min  base_step=%ds",
@@ -338,7 +245,6 @@ def analyze(
 
     biz_raw = _extract_values(bundle.business)
 
-    # Detect constant business metric
     biz_std     = float(np.std(biz_raw))
     is_constant = biz_std < CONSTANT_STD_THRESHOLD
     if is_constant:
@@ -348,7 +254,6 @@ def analyze(
             biz_std,
         )
 
-    # Build raw dict for resampling
     raw = {
         "biz":     biz_raw,
         "cpu":     _extract_values(bundle.cpu),
@@ -358,9 +263,6 @@ def analyze(
         "disk":    _extract_values(bundle.disk),
     }
 
-    # ── Filter simultaneous idle points before correlation analysis ───────────
-    # Uses max-based threshold (10% of max) — robust when idle ratio is high.
-    # Percentile-based threshold would fail with 80%+ idle data.
     biz_thr = float(biz_raw.max()) * 0.10
     cpu_thr = float(raw["cpu"].max()) * 0.10
     active  = (biz_raw > biz_thr) & (raw["cpu"] > cpu_thr)
@@ -378,10 +280,8 @@ def analyze(
             "using full dataset for correlation analysis", n_active,
         )
 
-    # ── Step CV ───────────────────────────────────────────────────────────────
     best_step = _select_best_step(raw_for_corr, base_step_seconds, max_lag)
 
-    # Resample filtered series at best step for CCF
     resampled   = _resample_bundle(raw_for_corr, base_step_seconds, best_step)
     max_lag_st  = max_lag * 60 // best_step   # lag in steps at best resolution
 
@@ -392,14 +292,12 @@ def analyze(
     net_d   = _first_difference(resampled["net"])
     dsk_d   = _first_difference(resampled["disk"])
 
-    # ── CCF per target ────────────────────────────────────────────────────────
     cpu_res = _analyze_pair(biz_d, cpu_d, "cpu",         max_lag_st)
     rgb_res = _analyze_pair(biz_d, rgb_d, "ram_gb",      max_lag_st)
     rpt_res = _analyze_pair(biz_d, rpt_d, "ram_percent", max_lag_st)
     net_res = _analyze_pair(biz_d, net_d, "network",     max_lag_st)
     dsk_res = _analyze_pair(biz_d, dsk_d, "disk",        max_lag_st)
 
-    # Convert lag from steps → minutes
     step_min = best_step / 60
     for res in [cpu_res, rgb_res, rpt_res, net_res, dsk_res]:
         res.lag_minutes = round(res.lag_minutes * step_min)

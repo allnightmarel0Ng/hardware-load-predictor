@@ -1,11 +1,3 @@
-"""
-extrapolation_test_with_long_spiky.py
-─────────────────────────────────────────────────────────────────────────────
-Расширенная версия extrapolation_test.py с новым паттерном long_spiky:
-  - Длительные периоды нулевой активности
-  - Резкие всплески высокой интенсивности, длящиеся часами
-  - Проверка экстраполяции для такого режима
-"""
 from __future__ import annotations
 
 import argparse
@@ -28,9 +20,6 @@ except ImportError:
     HAS_XGB = False
     from sklearn.ensemble import GradientBoostingRegressor
 
-# ============================================================================
-#  Конфигурация
-# ============================================================================
 SCRIPTS_DIR = Path(__file__).parent
 ALIBABA_FILE = SCRIPTS_DIR / "machine_usage_days_1_to_8_grouped_300_seconds.csv"
 GOOGLE_FILE = SCRIPTS_DIR / "instance_usage_grouped_300_seconds_month.csv"
@@ -41,7 +30,7 @@ STEP_SECONDS = 300
 TRUE_LAG = 1
 SIGNIFICANCE = 0.6
 LOOKBACK = 30
-TRAIN_RATIO = 0.8          # используется для временного разделения при экстраполяции
+TRAIN_RATIO = 0.8
 MAX_LAG = 20
 REL_STD_THRESHOLD = 0.05
 
@@ -49,15 +38,11 @@ CORR_LOW = 0.3
 CORR_MEDIUM = 0.5
 CORR_HIGH = 0.7
 
-# Порог для разделения train/test по RPS (квантиль от максимального значения RPS в обучающих данных)
 RPS_MAX_QUANTILE = 0.8
 
 TARGET_KEYS = ["cpu", "ram_gb", "ram_pct", "net", "disk"]
 RNG = np.random.default_rng(42)
 
-# ============================================================================
-#  Загрузка данных
-# ============================================================================
 def load_alibaba() -> Dict[str, np.ndarray]:
     if not ALIBABA_FILE.exists():
         raise FileNotFoundError(f"Alibaba not found.\ncurl -L '{ALIBABA_URL}' -o {ALIBABA_FILE}")
@@ -100,9 +85,6 @@ def load_google() -> Dict[str, np.ndarray]:
         "name": "Google 2019",
     }
 
-# ============================================================================
-#  Базовые функции для бизнес-метрики
-# ============================================================================
 def _cpu_to_proxy(cpu: np.ndarray, lag: int, coeff: float = 0.5, noise_std: float = 2.0) -> np.ndarray:
     n = len(cpu)
     shifted = np.empty(n)
@@ -155,48 +137,19 @@ def pattern_multimodal(cpu: np.ndarray, lag: int) -> np.ndarray:
     scale = 1.0 - 0.7 * weekend_mask
     return np.clip(base * scale + RNG.normal(0, 1, n), 0.5, 300)
 
-# ============================================================================
-#  НОВЫЙ ПАТТЕРН: long_spiky
-# ============================================================================
 def pattern_long_spiky(cpu: np.ndarray, lag: int) -> np.ndarray:
-    """
-    Бизнес-метрика с длительными периодами нулевой активности и резкими всплесками,
-    которые длятся продолжительное время (часы).
-    """
     n = len(cpu)
-    # Начинаем с нулевого фона
     biz = np.zeros(n)
-    # Определяем количество всплесков (случайное, чтобы не было периодичности)
-    n_spikes = RNG.integers(3, 8)   # от 3 до 7 всплесков
+    n_spikes = RNG.integers(3, 8)
     for _ in range(n_spikes):
-        # Длительность всплеска: от 1 до 4 часов (12-48 шагов по 5 мин)
         duration = RNG.integers(12, 67)
-        # Высота всплеска: от 100 до 300 (масштаб, чтобы CPU откликался)
         amplitude = RNG.uniform(100, 300)
-        # Начало всплеска: случайное, но не слишком близко к границам
         start = RNG.integers(LOOKBACK, n - duration - LOOKBACK)
-        # Заполняем интервал значением amplitude + шум
         biz[start:start+duration] = amplitude + RNG.normal(0, 5, duration)
-    # Добавляем небольшой шум на нулевые участки (чтобы не было строгого нуля)
     zero_mask = biz == 0
     biz[zero_mask] = RNG.normal(0, 1, np.sum(zero_mask))
-    # Применяем сдвиг (lag): бизнес-метрика должна опережать CPU на lag шагов.
-    # Для этого сдвигаем proxy относительно CPU. Строим proxy как взвешенную сумму сдвинутого CPU.
-    # Используем логику _cpu_to_proxy, но с коэффициентом, чтобы амплитуда была в нужном диапазоне.
-    # Проще: создаём базовую прокси из CPU, затем накладываем нашу структуру.
-    # Но чтобы сохранить причинно-следственную связь, нужно сдвинуть CPU.
-    # Сделаем так: proxy = _cpu_to_proxy(cpu, lag) с большим коэффициентом, а затем заменим её форму.
-    # Однако бизнес-метрика должна вести себя независимо от CPU? В реальности бизнес-метрика (RPS) не зависит от CPU.
-    # Мы строим бизнес-метрику как независимую переменную, а затем модель будет предсказывать CPU.
-    # В данном случае мы просто создаём искусственную бизнес-метрику с длинными всплесками, которая потом будет использована для предсказания CPU.
-    # Для сохранения реализма, можно масштабировать полученную biz так, чтобы её среднее соответствовало масштабу CPU.
-    # Но для чистоты эксперимента оставим как есть.
-    # Ограничим сверху 300 (как в других паттернах)
     return np.clip(biz, 0.5, 300)
 
-# ============================================================================
-#  Словарь паттернов (добавляем long_spiky)
-# ============================================================================
 PATTERNS: Dict[str, Tuple[str, Callable]] = {
     "sinusoidal": ("Sinusoidal (SaaS daily wave)", pattern_sinusoidal),
     "step":       ("Step function (batch / ETL)",   pattern_step),
@@ -206,9 +159,6 @@ PATTERNS: Dict[str, Tuple[str, Callable]] = {
     "long_spiky": ("Long spikes (long idle + burst hours)", pattern_long_spiky),
 }
 
-# ============================================================================
-#  Корреляция и признаки (те же, что в extrapolation_test.py)
-# ============================================================================
 def _pearson(a: np.ndarray, b: np.ndarray) -> float:
     if len(a) < 3 or a.std() < 1e-9 or b.std() < 1e-9:
         return 0.0
@@ -286,9 +236,6 @@ def build_features_full(biz: np.ndarray, ds: Dict[str, np.ndarray], tau: int) ->
     X = StandardScaler().fit_transform(np.array(rows))
     return X
 
-# ============================================================================
-#  Экстраполяционный тест (тот же, что в предыдущей версии)
-# ============================================================================
 def train_ridge(X, y):
     ridge = Ridge(alpha=1.0)
     ridge.fit(X, y)
@@ -382,9 +329,6 @@ def run_extrapolation_test(ds: Dict[str, np.ndarray], biz: np.ndarray, lag_true:
         }
     return all_res
 
-# ============================================================================
-#  MAIN
-# ============================================================================
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=["alibaba","google","both"], default="alibaba")

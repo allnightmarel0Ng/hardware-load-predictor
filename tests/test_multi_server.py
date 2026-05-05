@@ -1,11 +1,3 @@
-"""
-Tests for multi-server support:
-  - ServerGroup CRUD (server_group_manager)
-  - Server CRUD
-  - Config provisioning
-  - Cluster forecast (cluster_forecaster)
-  - API endpoints
-"""
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -24,8 +16,6 @@ from app.schemas.schemas import (
 from fastapi import HTTPException
 
 
-# ── fixtures ──────────────────────────────────────────────────────────────────
-
 def _group_data(name: str = "test-cluster") -> ServerGroupCreate:
     return ServerGroupCreate(
         name=name,
@@ -40,10 +30,6 @@ def _server_data(name: str = "node-1", host: str = "10.0.0.1") -> ServerCreate:
     return ServerCreate(name=name, host=host, port=9090,
                         tags={"datacenter": "eu-west-1"})
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ServerGroup CRUD
-# ══════════════════════════════════════════════════════════════════════════════
 
 class TestServerGroupCRUD:
     def test_create_group(self, db):
@@ -92,13 +78,8 @@ class TestServerGroupCRUD:
         g = create_group(db, _group_data("cascade-group"))
         add_server(db, g.id, _server_data("cascade-node"))
         delete_group(db, g.id)
-        # Server should be gone too
         assert db.query(Server).filter_by(group_id=g.id).count() == 0
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Server CRUD
-# ══════════════════════════════════════════════════════════════════════════════
 
 class TestServerCRUD:
     def test_add_server(self, db):
@@ -177,10 +158,6 @@ class TestServerCRUD:
         assert exc.value.status_code == 404
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Config provisioning
-# ══════════════════════════════════════════════════════════════════════════════
-
 class TestProvisionGroupConfigs:
     def test_creates_config_per_server(self, db):
         g = create_group(db, _group_data("prov-group"))
@@ -223,13 +200,14 @@ class TestProvisionGroupConfigs:
         assert configs[0].name == "my-cluster::api-1"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Cluster Forecaster
-# ══════════════════════════════════════════════════════════════════════════════
-
 class TestClusterForecaster:
+    @pytest.fixture(autouse=True)
+    def mock_prometheus(self):
+        with patch("app.modules.forecasting_engine._fetch_series", return_value=__import__("numpy").zeros(30)),              patch("app.modules.forecasting_engine._fetch_biz_history", return_value=__import__("numpy").zeros(30)):
+            yield
+
     def _setup_group_with_models(self, db, name: str, n_servers: int = 2):
-        """Create a group with n servers, each with a provisioned config."""
+        
         from app.modules.config_manager import create_config
         from app.modules.data_collector import fetch_historical_data
         from app.modules.correlation_analyzer import analyze
@@ -238,7 +216,6 @@ class TestClusterForecaster:
         g = create_group(db, _group_data(name))
         for i in range(n_servers):
             s = add_server(db, g.id, _server_data(f"node-{i}", f"10.0.0.{i+1}"))
-            # Create config linked to this server
             from app.schemas.schemas import ForecastingConfigCreate
             from app.modules.config_manager import create_config
             cfg = db.query(ForecastingConfig).filter_by(server_id=s.id).first()
@@ -253,8 +230,7 @@ class TestClusterForecaster:
                 cfg = create_config(db, cfg_data)
                 cfg.server_id = s.id
                 db.commit()
-            # Train a model for this config
-            bundle = fetch_historical_data(cfg.host, cfg.port, cfg.business_metric_formula, lookback_days=7)
+            bundle = fetch_historical_data(cfg.host, cfg.port, cfg.business_metric_formula, lookback_days=2, step_seconds=300)
             report = analyze(bundle)
             train_model(db, cfg, bundle, report)
         return g
@@ -293,7 +269,6 @@ class TestClusterForecaster:
     def test_server_without_model_is_skipped(self, db):
         g = create_group(db, _group_data("cf-skip"))
         s = add_server(db, g.id, _server_data("no-model"))
-        # Provision config but do NOT train
         provision_group_configs(db, g.id)
         result = forecast_cluster(db, g.id, 1000.0)
         assert result.n_servers == 0
@@ -312,10 +287,6 @@ class TestClusterForecaster:
         assert result.group_name == "cf-gname"
         assert result.business_metric_value == 500.0
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# API endpoint tests
-# ══════════════════════════════════════════════════════════════════════════════
 
 GROUP_PAYLOAD = {
     "name": "api-test-group",
@@ -441,7 +412,6 @@ class TestGroupAPIEndpoints:
     def test_group_train_no_configs_422(self, client):
         g = self._create_group(client, "train-noprov-g")
         client.post(f"/groups/{g['id']}/servers/", json=SERVER_PAYLOAD)
-        # Note: NOT calling /provision — so no configs exist
         r = client.post(f"/groups/{g['id']}/train/", json={"lookback_days": 7})
         assert r.status_code == 422
 

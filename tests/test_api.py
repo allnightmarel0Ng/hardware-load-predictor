@@ -1,19 +1,8 @@
-"""
-Integration tests for the REST API (Module 7 — Request Handler).
-Uses FastAPI TestClient — no real HTTP, but full routing + DB pipeline.
-
-Training is async — POST /train/ returns 202 + job_id (status=queued).
-The test client runs everything synchronously inside the worker thread,
-so by the time the job runner's _run_training_job finishes, the model
-is in the DB and ready to query.
-"""
 import pytest
 from unittest.mock import patch
 
 from app.modules import job_runner
 
-
-# ── helpers ───────────────────────────────────────────────────────────────────
 
 CONFIG_PAYLOAD = {
     "name":                   "api-test-config",
@@ -31,35 +20,27 @@ def _create_config(client, name: str) -> dict:
 
 
 def _train(client, config_id: int) -> dict:
-    """Submit a training job and return the job response body."""
+    
     r = client.post(f"/configs/{config_id}/train/", json={"lookback_days": 7})
     assert r.status_code == 202, r.text
     return r.json()
 
 
 def _create_and_train(client, name: str) -> tuple[dict, dict]:
-    """Create config + submit training. Returns (config, job) dicts."""
+    
     cfg = _create_config(client, name)
     job = _train(client, cfg["id"])
     return cfg, job
 
 
 def _wait_for_model(client, config_id: int) -> int:
-    """
-    Poll GET /jobs/{id} until done, then return the model_id.
-    In tests the executor runs jobs synchronously in the same process,
-    so we only need a single poll.
-    """
-    # list models directly — cleaner than polling in unit tests
+    
     r = client.get(f"/configs/{config_id}/train/models")
     assert r.status_code == 200
     models = r.json()
     assert len(models) >= 1, "No models found after training"
-    # models are returned newest-first
     return models[0]["id"]
 
-
-# ── /health ───────────────────────────────────────────────────────────────────
 
 class TestHealth:
     def test_health_returns_ok(self, client):
@@ -67,8 +48,6 @@ class TestHealth:
         assert r.status_code == 200
         assert r.json() == {"status": "ok"}
 
-
-# ── /configs ──────────────────────────────────────────────────────────────────
 
 class TestConfigEndpoints:
     def test_create_config_201(self, client):
@@ -120,8 +99,6 @@ class TestConfigEndpoints:
         assert r.status_code == 422
 
 
-# ── /configs/{id}/train + /jobs ───────────────────────────────────────────────
-
 class TestTrainEndpoints:
     def test_train_returns_202_with_job_id(self, client):
         cfg = _create_config(client, "train-202")
@@ -156,7 +133,6 @@ class TestTrainEndpoints:
         assert r.status_code == 200
         models = r.json()
         assert len(models) >= 1
-        # newest-first: version numbers should be descending
         versions = [m["version"] for m in models]
         assert versions == sorted(versions, reverse=True)
 
@@ -176,7 +152,6 @@ class TestTrainEndpoints:
         body = r.json()
         assert body["id"] == job["job_id"]
         assert body["config_id"] == cfg["id"]
-        # status is one of the valid lifecycle states
         assert body["status"] in ("queued", "running", "done", "failed")
 
     def test_get_missing_job_404(self, client):
@@ -189,8 +164,6 @@ class TestTrainEndpoints:
         job_r = client.get(f"/jobs/{job_id}")
         assert job_r.json()["lookback_days"] == 14
 
-
-# ── /configs/{id}/forecast ────────────────────────────────────────────────────
 
 class TestForecastEndpoints:
     def _trained_config(self, client, name: str) -> dict:
@@ -261,11 +234,9 @@ class TestForecastEndpoints:
         assert "model_id" in body
 
 
-# ── /models/{id}/accuracy ─────────────────────────────────────────────────────
-
 class TestAccuracyEndpoints:
     def _setup(self, client, name: str) -> tuple[dict, int]:
-        """Create config, train, return (config, model_id)."""
+        
         cfg, _ = _create_and_train(client, name)
         model_id = _wait_for_model(client, cfg["id"])
         return cfg, model_id
@@ -280,7 +251,7 @@ class TestAccuracyEndpoints:
         assert "n_evaluations" in body
 
     def test_accuracy_status_unhealthy_before_evaluation(self, client):
-        """No evaluations yet → is_healthy=False."""
+        
         cfg, model_id = self._setup(client, "acc-unhealthy")
         r = client.get(f"/models/{model_id}/accuracy")
         assert r.json()["is_healthy"] is False
@@ -290,7 +261,7 @@ class TestAccuracyEndpoints:
         assert client.get("/models/999999/accuracy").status_code == 404
 
     def test_force_evaluate_409_without_enough_samples(self, client):
-        """No ForecastResult rows with actuals yet → 409."""
+        
         from unittest.mock import patch
         cfg, model_id = self._setup(client, "acc-force-empty")
         with patch(

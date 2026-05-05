@@ -1,9 +1,3 @@
-"""add quality_metric_overrides to forecasting_configs
-
-Revision ID: 0005_quality_metric_overrides
-Revises: 0004_instance_label
-Create Date: 2026-04-16
-"""
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB

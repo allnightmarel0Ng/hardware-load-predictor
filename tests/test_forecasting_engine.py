@@ -1,4 +1,4 @@
-"""Unit tests for Module 5 — Forecasting Engine."""
+
 import pytest
 
 from app.modules.config_manager import create_config
@@ -10,10 +10,8 @@ from app.models.db_models import ForecastResult
 from app.schemas.schemas import ForecastingConfigCreate
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
-
 def _prepare_config_and_model(db, name: str):
-    """Create a config and train a model on it. Returns (config, model)."""
+    
     cfg = create_config(
         db,
         ForecastingConfigCreate(
@@ -29,8 +27,6 @@ def _prepare_config_and_model(db, name: str):
     model = train_model(db, cfg, bundle, report)
     return cfg, model
 
-
-# ── tests ─────────────────────────────────────────────────────────────────────
 
 class TestForecastingEngine:
     def test_returns_forecast_result(self, db):
@@ -67,7 +63,7 @@ class TestForecastingEngine:
         assert result.business_metric_value == pytest.approx(biz_val)
 
     def test_higher_load_predicts_higher_resources(self, db):
-        """Linear model: higher business value → higher predicted load."""
+        
         cfg, _ = _prepare_config_and_model(db, "fc-monotone")
         low  = forecast(db, cfg, business_metric_value=100.0)
         high = forecast(db, cfg, business_metric_value=2000.0)
@@ -91,9 +87,7 @@ class TestForecastingEngine:
 
     def test_uses_latest_model_after_retrain(self, db):
         cfg, first_model = _prepare_config_and_model(db, "fc-retrain")
-        # Retrain
         bundle = fetch_historical_data(cfg.host, cfg.port, cfg.business_metric_formula)
         second_model = train_model(db, cfg, bundle, analyze(bundle))
-        # Forecast should use the second model
         result = forecast(db, cfg, business_metric_value=500.0)
         assert result.model_id == second_model.id

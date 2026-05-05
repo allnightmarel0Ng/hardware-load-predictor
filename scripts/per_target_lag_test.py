@@ -29,7 +29,7 @@ STEP_SECONDS = 300
 TRUE_LAG = 1
 SIGNIFICANCE = 0.6
 LOOKBACK = 30
-TRAIN_RATIO = 0.8           # доля для определения лагов
+TRAIN_RATIO = 0.8
 
 CORR_STRONG = 0.7
 CORR_MEDIUM = 0.4
@@ -89,21 +89,6 @@ def _cpu_to_proxy(cpu, lag, coeff=0.5, noise_std=2.0):
     s[:n-lag]=cpu[lag:]; s[n-lag:]=cpu[-1]
 
     return np.maximum(0.5, s/coeff+rng.normal(0,noise_std,n))
-
-# # ============================================================================
-# #  Бизнес-метрики (синтетические, используют все системные метрики)
-# # ============================================================================
-# def _cpu_to_proxy(metrics: Dict[str, np.ndarray], lag: int, weights=(0.5, 0.3, 0.1, 0.1)) -> np.ndarray:
-#     """Взвешенная сумма сдвинутых системных метрик (нормализованных по std)."""
-#     n = len(metrics['cpu'])
-#     proxy = np.zeros(n)
-#     for key, w in zip(['cpu', 'ram_pct', 'net', 'disk'], weights):
-#         shifted = np.empty(n)
-#         shifted[:n - lag] = metrics[key][lag:]
-#         shifted[n - lag:] = metrics[key][-1]
-#         proxy += w * (shifted / (np.std(metrics[key]) + 1e-9))
-#     proxy += RNG.normal(0, 2.0, n)
-#     return np.maximum(0.5, proxy)
 
 def pattern_sinusoidal(metrics: Dict[str, np.ndarray], lag: int) -> np.ndarray:
     n = len(metrics['cpu'])
@@ -185,7 +170,6 @@ def find_lag(biz: np.ndarray, sys: np.ndarray, max_lag: int = 20) -> Tuple[int, 
         score = abs(_pearson(a, b)) + abs(_spearman(a, b))
         if score > best_score:
             best_score, best_lag = score, lag
-    # финальные корреляции для найденного лага
     if best_lag == 0:
         a, b = xd, yd
     else:
@@ -197,13 +181,6 @@ def find_lag(biz: np.ndarray, sys: np.ndarray, max_lag: int = 20) -> Tuple[int, 
     return best_lag, p, s, r, r >= SIGNIFICANCE
 
 def get_correlation_info(biz: np.ndarray, sys: np.ndarray, train_ratio: float = 0.8, max_lag: int = 20) -> Dict:
-    """
-    Возвращает словарь с информацией о корреляции:
-      - lag
-      - r (max |corr|)
-      - significant
-      - strength ('strong', 'medium', 'none')
-    """
     split = int(train_ratio * len(biz))
     biz_train = biz[:split]
     sys_train = sys[:split]
@@ -218,10 +195,6 @@ def get_correlation_info(biz: np.ndarray, sys: np.ndarray, train_ratio: float = 
 
 def build_features_adaptive(biz: np.ndarray, ds: Dict[str, np.ndarray],
                             tau: int, biz_strength: str) -> np.ndarray:
-    """
-    biz_strength: 'strong', 'medium', 'none'
-    Возвращает матрицу X (стандартизованную).
-    """
     n = ds["n"]
     rows = []
     for i in range(LOOKBACK, n - 1):
@@ -234,32 +207,25 @@ def build_features_adaptive(biz: np.ndarray, ds: Dict[str, np.ndarray],
         cos_d = math.cos(2 * math.pi * dow / 7)
         trend = i / n
 
-        # ---- бизнес-признаки (в зависимости от силы) ----
         biz_feats = []
         if biz_strength != 'none':
             bl = biz[i - tau] if i >= tau else biz[0]
-            biz_feats.append(bl)      # сдвиг
+            biz_feats.append(bl)
             if biz_strength == 'strong':
-                # нормализация скользящим средним
                 rm30 = biz[max(0, i-30):i].mean()
                 bn = bl / (rm30 + 1e-9)
                 biz_feats.append(bn)
-                # разности
                 d1 = biz[i] - biz[i-1] if i >= 1 else 0.0
                 d2 = biz[i-1] - biz[i-2] if i >= 2 else 0.0
                 biz_feats.extend([d1, d2])
-                # z-score
                 mu5 = biz[max(0, i-5):i].mean()
                 bz = (biz[i] - mu5) / (biz[max(0, i-5):i].std() + 1e-9)
                 biz_feats.append(bz)
-                # взаимодействия со временем
                 biz_feats.extend([bl * sin_h, bl * cos_h])
             elif biz_strength == 'medium':
-                # только разность
                 d1 = biz[i] - biz[i-1] if i >= 1 else 0.0
                 biz_feats.append(d1)
 
-        # ---- авторегрессионные признаки системных метрик (всегда) ----
         sys_feats = []
         for key in ("cpu", "ram_pct", "net", "disk"):
             arr = ds[key]
@@ -293,10 +259,6 @@ def _make_base(params: Dict):
                                      subsample=0.8, min_samples_leaf=5)
 
 def train_cv_single(X: np.ndarray, y: np.ndarray) -> Tuple[object, np.ndarray, np.ndarray]:
-    """
-    Временное CV (3 folds) для подбора гиперпараметров, затем обучение на train+val
-    и возврат модели, тестовых X и y (последние 20%).
-    """
     n = len(X)
     test_size = int(0.2 * n)
     X_tv, X_test = X[:n - test_size], X[n - test_size:]
@@ -321,7 +283,6 @@ def train_cv_single(X: np.ndarray, y: np.ndarray) -> Tuple[object, np.ndarray, n
     return final_model, X_test, y_test
 
 def run(ds: Dict[str, np.ndarray], label: str, biz_fn: Callable, lag_true: int) -> Dict[str, float]:
-    """Сравнивает две стратегии для одного паттерна и датасета."""
     biz = biz_fn(ds, lag_true)
     n = ds["n"]
     algo = "XGBoost" if HAS_XGB else "GBM"
@@ -347,12 +308,10 @@ def run(ds: Dict[str, np.ndarray], label: str, biz_fn: Callable, lag_true: int) 
     global_lag = int(np.median(list(lags.values())))
     print(f"  Global lag (median): {global_lag}step = {global_lag*STEP_SECONDS//60}min")
 
-    # ---- 2. Целевые значения (y) после LOOKBACK ----
     y_targets = {}
     for key in TARGET_KEYS:
         y_targets[key] = ds[key][LOOKBACK:n-1]
 
-    # ---- 3. Сравнение для каждого таргета (глобальный лаг против пер-таргетного) ----
     print(f"\n  {'Target':<10} {'τ_A':>4} {'R²_A':>8} {'τ_B':>4} {'R²_B':>8} "
           f"{'ΔR²':>8}  Winner")
     print(f"  {'-'*10} {'-'*4} {'-'*8} {'-'*4} {'-'*8} {'-'*8}  {'-'*6}")
@@ -361,17 +320,11 @@ def run(ds: Dict[str, np.ndarray], label: str, biz_fn: Callable, lag_true: int) 
     for key in TARGET_KEYS:
         y_t = y_targets[key]
 
-        # ---- Approach A: глобальный лаг, адаптивные признаки по силе глобальной корреляции ----
-        # Для A используем силу корреляции, посчитанную для этой метрики (но с глобальным лагом?)
-        # Логично: для A берём ту же силу, что и для B? Нет, потому что в A бизнес-признак один для всех.
-        # Поскольку у нас цель сравнить стратегии, для A мы используем ту же логику адаптации,
-        # но с лагом global_lag и с той же strength, которая была определена для этой метрики.
-        strength_a = strengths[key]   # адаптация в зависимости от корреляции с бизнесом (но лаг глобальный)
+        strength_a = strengths[key]
         X_a = build_features_adaptive(biz, ds, global_lag, strength_a)
         m_a, Xte_a, yte_a = train_cv_single(X_a, y_t)
         r2_a = r2_score(yte_a, m_a.predict(Xte_a))
 
-        # ---- Approach B: пер-таргетный лаг, адаптивные признаки ----
         tau_b = lags.get(key, 0)
         strength_b = strengths[key]
         X_b = build_features_adaptive(biz, ds, tau_b, strength_b)

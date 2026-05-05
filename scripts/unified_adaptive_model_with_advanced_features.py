@@ -142,9 +142,7 @@ PATTERNS: Dict[str, Tuple[str, Callable]] = {
     "multimodal": ("Multimodal (weekday/weekend split)", pattern_multimodal),
 }
 
-# ============================================================================
-#  Корреляция и лаг (на обучающей выборке)
-# ============================================================================
+
 def _pearson(a: np.ndarray, b: np.ndarray) -> float:
     if len(a) < 3 or a.std() < 1e-9 or b.std() < 1e-9:
         return 0.0
@@ -211,19 +209,10 @@ def hurst_rs(series: np.ndarray) -> float:
 
 def build_advanced_features(biz: np.ndarray, ds: Dict[str, np.ndarray],
                             tau: int, target_key: str) -> np.ndarray:
-    """
-    Строит расширенные признаки для заданной целевой метрики.
-    Включает:
-      - временные (час, день недели, тренд)
-      - бизнес-признаки (сдвиг, нормализация, разности, z-score, взаимодействия)
-      - авторегрессионные для всех системных метрик (лаги, rolling mean/std)
-      - специфичные для target_key признаки (EWMA, CV, burst ratio, Hurst, инерционность и т.д.)
-    """
     n = ds["n"]
     target_arr = ds[target_key]
     rows = []
     for i in range(LOOKBACK, n - 1):
-        # ---- время ----
         hour = (i * STEP_SECONDS / 3600) % 24
         dow = (i * STEP_SECONDS / 86400) % 7
         sin_h = math.sin(2 * math.pi * hour / 24)
@@ -233,7 +222,6 @@ def build_advanced_features(biz: np.ndarray, ds: Dict[str, np.ndarray],
         trend = i / n
         feats = [sin_h, cos_h, sin_d, cos_d, trend]
 
-        # ---- бизнес-признаки (full) ----
         bl = biz[i - tau] if i >= tau else biz[0]
         rm30 = biz[max(0, i-30):i].mean()
         bn = bl / (rm30 + 1e-9)
@@ -243,7 +231,6 @@ def build_advanced_features(biz: np.ndarray, ds: Dict[str, np.ndarray],
         bz = (biz[i] - mu5) / (biz[max(0, i-5):i].std() + 1e-9)
         feats.extend([bl, bn, d1, d2, bz, bl*sin_h, bl*cos_h])
 
-        # ---- авторегрессия для всех системных метрик ----
         for key in ("cpu", "ram_pct", "net", "disk"):
             arr = ds[key]
             l1 = arr[i-1]
@@ -256,10 +243,9 @@ def build_advanced_features(biz: np.ndarray, ds: Dict[str, np.ndarray],
             s15 = arr[max(0, i-15):i].std() + 1e-9
             feats.extend([l1, l2, l3, m5, m15, m30, s5, s15])
 
-        # ---- расширенные признаки для target_key ----
-        hist = target_arr[:i]   # вся история до i
+        hist = target_arr[:i]
         if len(hist) < 30:
-            extra = [0.0] * 6   # запас на максимум 6 признаков
+            extra = [0.0] * 6
         else:
             window5 = hist[-5:]
             window15 = hist[-15:]
@@ -320,9 +306,7 @@ def build_advanced_features(biz: np.ndarray, ds: Dict[str, np.ndarray],
     X = StandardScaler().fit_transform(np.array(rows))
     return X
 
-# ============================================================================
-#  Выбор модели и метрики (адаптивно)
-# ============================================================================
+
 def select_model_and_metric(r: float, rel_std: float) -> Tuple[str, List[Dict], str, float]:
     if rel_std < REL_STD_THRESHOLD:
         return 'mean_baseline', [], 'rel_mae', 0.05
@@ -336,7 +320,6 @@ def select_model_and_metric(r: float, rel_std: float) -> Tuple[str, List[Dict], 
         return 'xgboost', [{'n_estimators': 500, 'max_depth': 6, 'learning_rate': 0.03}], 'r2', 0.85
 
 def train_model_with_cv(X: np.ndarray, y: np.ndarray, model_type: str, param_grid: List[Dict]) -> Tuple[np.ndarray, np.ndarray]:
-    """Возвращает (predictions, y_test) для последних 20% данных."""
     n = len(X)
     test_size = int(0.2 * n)
     X_tv, X_test = X[:n - test_size], X[n - test_size:]
@@ -366,7 +349,6 @@ def train_model_with_cv(X: np.ndarray, y: np.ndarray, model_type: str, param_gri
             best_score = mean_score
             best_params = params
 
-    # финальная модель на train+val
     if model_type == 'ridge':
         final_model = Ridge(**best_params, random_state=42)
     elif model_type == 'gbm':
@@ -399,11 +381,9 @@ def run_unified(ds: Dict[str, np.ndarray], label: str, biz_fn: Callable, lag_tru
     print(f"  Pattern : {label}  |  Dataset : {ds['name']}")
     print(f"  Biz: mean={biz.mean():.1f}  std={biz.std():.1f}")
 
-    # Для каждого таргета
     print("\n  Target   |  lag  |   r*   | rel_std |   model   |  metric  |  value  | PASS?")
     print("  ---------+-------+--------+---------+-----------+----------+---------+------")
     for key in TARGET_KEYS:
-        # лаг и корреляция на обучающей выборке
         split = int(TRAIN_RATIO * n)
         biz_train = biz[:split]
         sys_train = ds[key][:split]
@@ -412,18 +392,14 @@ def run_unified(ds: Dict[str, np.ndarray], label: str, biz_fn: Callable, lag_tru
         std_val = ds[key].std()
         rel_std = std_val / (mean_val + 1e-9)
 
-        # выбор модели и метрики
         model_type, param_grid, eval_metric, threshold = select_model_and_metric(r, rel_std)
 
-        # расширенные признаки
         X = build_advanced_features(biz, ds, lag, key)
         y = ds[key][LOOKBACK:n-1]
 
-        # обучение и оценка
         pred, y_test = train_model_with_cv(X, y, model_type, param_grid)
         value, passed = evaluate(pred, y_test, eval_metric, threshold)
 
-        # режим для вывода
         if rel_std < REL_STD_THRESHOLD:
             mode = 'low_var'
         elif r < CORR_LOW:
@@ -437,9 +413,7 @@ def run_unified(ds: Dict[str, np.ndarray], label: str, biz_fn: Callable, lag_tru
 
         print(f"  {key:<8} | {lag:3d}   | {r:6.3f} | {rel_std:7.4f} | {model_type:9s} | {eval_metric:8s} | {value:7.4f} | {'YES' if passed else 'NO'}")
 
-# ============================================================================
-#  MAIN
-# ============================================================================
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=["alibaba","google","both"], default="alibaba")

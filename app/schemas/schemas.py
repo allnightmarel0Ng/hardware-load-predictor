@@ -2,8 +2,6 @@ from datetime import datetime
 from pydantic import BaseModel, Field, ConfigDict
 
 
-# ── Server Groups ─────────────────────────────────────────────────────────────
-
 class ServerGroupCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255, examples=["api-cluster-prod"])
     description: str | None = Field(default=None)
@@ -47,8 +45,6 @@ class ServerGroupRead(BaseModel):
     servers: list[ServerRead] = []
 
 
-# ── Servers ───────────────────────────────────────────────────────────────────
-
 class ServerCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255, examples=["api-node-1"])
     host: str = Field(..., examples=["10.0.1.10"])
@@ -62,8 +58,6 @@ class ServerUpdate(BaseModel):
     tags: dict | None = None
     is_active: bool | None = None
 
-
-# ── Cluster Forecast ──────────────────────────────────────────────────────────
 
 class ServerForecastRead(BaseModel):
     server_id: int
@@ -88,7 +82,6 @@ class ClusterForecastResponse(BaseModel):
     business_metric_value: float
     n_servers: int
     servers: list[ServerForecastRead]
-    # Cluster-level aggregates
     cluster_cpu_avg_percent:     float
     cluster_ram_total_gb:        float
     cluster_ram_avg_percent:     float
@@ -97,16 +90,12 @@ class ClusterForecastResponse(BaseModel):
     skipped_servers: list[str]
 
 
-# ── Provision ─────────────────────────────────────────────────────────────────
-
 class ProvisionResponse(BaseModel):
     group_id: int
     configs_created: int
     config_ids: list[int]
     message: str
 
-
-# ── Forecasting Config ────────────────────────────────────────────────────────
 
 class ForecastingConfigCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255, examples=["orders-to-cpu"])
@@ -156,31 +145,13 @@ class ForecastingConfigRead(BaseModel):
     updated_at: datetime
 
 
-# ── Trained Model ─────────────────────────────────────────────────────────────
-
 class TargetQualityInfo(BaseModel):
-    """
-    Quality report for one system metric target.
-
-    The primary quality metric is chosen based on the nature of each metric:
-      CPU         → R²  (dynamic, directly driven by load)
-      RAM GB/PCT  → rel_mae = MAE/mean  (inertial, low variance — R² unreliable)
-      Network     → R² + MAPE combined  (moderately dynamic, often noisy)
-      Disk        → R² + MAPE combined  (inertial, weak business coupling)
-
-    Grades follow universal thresholds (see API docs):
-      CPU:  excellent R²≥0.95 MAPE≤5% | good R²≥0.85 MAPE≤10% | satisfactory R²≥0.70 MAPE≤15%
-      RAM:  excellent relMAE≤0.01 | good ≤0.03 | satisfactory ≤0.05
-      Net:  excellent R²≥0.90 MAPE≤10% | good R²≥0.75 MAPE≤20% | satisfactory R²≥0.50 MAPE≤30%
-      Disk: excellent R²≥0.85 MAPE≤15% | good R²≥0.65 MAPE≤25% | satisfactory R²≥0.40 MAPE≤40%
-    """
-    # ── Correlation info ──────────────────────────────────────────────────────
+    
     lag_steps:   int   = Field(..., description="Detected lag in steps (from correlation analysis on training split)")
     lag_minutes: int   = Field(..., description="Detected lag in minutes")
     r_star:      float = Field(..., description="Best correlation coefficient r* = max(|Pearson|, |Spearman|) at optimal lag")
     rel_std:     float = Field(..., description="Coefficient of variation (std/mean) — indicates metric variance; <0.05 = nearly constant")
 
-    # ── Adaptive model chosen ─────────────────────────────────────────────────
     model_type: str = Field(
         ...,
         description=(
@@ -189,7 +160,6 @@ class TargetQualityInfo(BaseModel):
         )
     )
 
-    # ── Primary quality metric ────────────────────────────────────────────────
     quality_metric: str = Field(
         ...,
         description=(
@@ -211,7 +181,6 @@ class TargetQualityInfo(BaseModel):
         description="Human-readable explanation of why this metric and grade were chosen"
     )
 
-    # ── All standard metrics (always computed) ────────────────────────────────
     r2:      float | None = Field(None, description="R² on test split (None for mean_baseline)")
     mae:     float | None = Field(None, description="MAE on test split")
     mape:    float | None = Field(None, description="MAPE % on test split")
@@ -230,7 +199,6 @@ class TrainedModelRead(BaseModel):
     lag_minutes: int | None
     trained_at: datetime | None
     created_at: datetime
-    # Per-target quality report (populated from parameters when available)
     per_target: dict[str, TargetQualityInfo] | None = Field(
         None,
         description=(
@@ -240,8 +208,6 @@ class TrainedModelRead(BaseModel):
         )
     )
 
-
-# ── Forecast (single-step with prediction intervals) ──────────────────────────
 
 class ForecastRequest(BaseModel):
     business_metric_value: float = Field(
@@ -256,13 +222,11 @@ class ForecastResponse(BaseModel):
     config_id: int
     model_id: int
     business_metric_value: float
-    # Point predictions (five targets)
     predicted_cpu_percent:     float
     predicted_ram_gb:          float
     predicted_ram_percent:     float
     predicted_network_mbps:    float
     predicted_disk_io_percent: float
-    # 80% prediction intervals (None if model trained on < 50 samples)
     lower_cpu_percent:         float | None
     lower_ram_gb:              float | None
     lower_ram_percent:         float | None
@@ -276,8 +240,6 @@ class ForecastResponse(BaseModel):
     created_at: datetime
     created_at: datetime
 
-
-# ── Forecast horizon (multi-step) ─────────────────────────────────────────────
 
 class HorizonStep(BaseModel):
     business_metric_value: float = Field(..., gt=0, examples=[1500.0])
@@ -321,8 +283,6 @@ class HorizonForecastResponse(BaseModel):
     steps: list[HorizonStepResponse]
 
 
-# ── Training trigger ──────────────────────────────────────────────────────────
-
 class TrainRequest(BaseModel):
     lookback_days: int = Field(
         default=30, ge=1, le=365,
@@ -335,8 +295,6 @@ class TrainResponse(BaseModel):
     model_id: int
     status: str
 
-
-# ── Accuracy Monitor ──────────────────────────────────────────────────────────
 
 class ModelEvaluationRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -376,8 +334,6 @@ class AccuracyStatusResponse(BaseModel):
     is_healthy: bool
     health_reason: str | None
 
-
-# ── Training Jobs ─────────────────────────────────────────────────────────────
 
 class TrainJobResponse(BaseModel):
     job_id: int

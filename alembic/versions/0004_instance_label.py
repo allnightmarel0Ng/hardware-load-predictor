@@ -1,9 +1,3 @@
-"""add instance_label to forecasting_configs
-
-Revision ID: 0004_instance_label
-Revises: 0003_five_targets
-Create Date: 2026-04-13
-"""
 from alembic import op
 import sqlalchemy as sa
 

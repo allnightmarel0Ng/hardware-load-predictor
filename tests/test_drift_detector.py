@@ -1,4 +1,3 @@
-"""Tests for drift_detector.py — PSI computation and distribution snapshots."""
 import pytest
 import numpy as np
 
@@ -14,8 +13,6 @@ from app.modules.drift_detector import (
 
 RNG = np.random.default_rng(42)
 
-
-# ── _psi core ─────────────────────────────────────────────────────────────────
 
 class TestPsiCore:
     def test_identical_distributions_give_zero_psi(self):
@@ -82,8 +79,6 @@ class TestPsiCore:
         assert result.is_drifted == (result.psi >= PSI_MODERATE)
 
 
-# ── compute_reference_distribution ────────────────────────────────────────────
-
 class TestComputeReferenceDistribution:
     def test_returns_required_keys(self):
         data = RNG.normal(1000, 200, 500)
@@ -102,7 +97,6 @@ class TestComputeReferenceDistribution:
     def test_freqs_sum_to_approximately_one(self):
         data = RNG.normal(500, 100, 400)
         snap = compute_reference_distribution(data)
-        # Freqs include epsilon, so sum is slightly above 1
         assert abs(sum(snap["freqs"]) - 1.0) < 0.1
 
     def test_handles_constant_series(self):
@@ -111,8 +105,6 @@ class TestComputeReferenceDistribution:
         assert snap["n_samples"] == 100
         assert snap["mean"] == 42.0
 
-
-# ── check_drift_from_snapshot ─────────────────────────────────────────────────
 
 class TestCheckDriftFromSnapshot:
     def _snap(self, mean: float = 1000.0, std: float = 200.0, n: int = 500) -> dict:
@@ -155,11 +147,9 @@ class TestCheckDriftFromSnapshot:
             assert result.is_drifted == (result.psi >= PSI_MODERATE)
 
     def test_roundtrip_same_data(self):
-        """Storing and restoring should give near-zero PSI."""
+        
         data = RNG.normal(1500, 300, 600)
         snap = compute_reference_distribution(data)
-        # Use a fresh draw from the same distribution
         current = RNG.normal(1500, 300, 300)
         result  = check_drift_from_snapshot(snap, current)
-        # Should be stable or at most moderate (sampling variance)
         assert result.psi < PSI_MODERATE * 2   # generous threshold for random draws

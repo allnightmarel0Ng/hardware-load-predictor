@@ -1,25 +1,3 @@
-"""
-evaluate_prophet.py
-───────────────────────────────────────────────────────────────────────────────
-Compares Prophet vs XGBoost for predicting system metrics (CPU, RAM, Network,
-Disk) from a business metric across five real-world load patterns.
-
-Key question: can Prophet extrapolate beyond the training range of the
-business metric — i.e. predict CPU at RPS=20 when max training RPS was 8?
-
-Setup:
-    pip install prophet xgboost scikit-learn numpy pandas
-
-Usage:
-    # All patterns, Alibaba-like dataset
-    python evaluate_prophet.py
-
-    # Single pattern
-    python evaluate_prophet.py --pattern sinusoidal
-
-    # Test extrapolation explicitly
-    python evaluate_prophet.py --test-extrapolation
-"""
 from __future__ import annotations
 
 import argparse
@@ -44,19 +22,15 @@ except ImportError:
 
 warnings.filterwarnings("ignore")
 
-# ── Constants ─────────────────────────────────────────────────────────────────
 
-STEP_SECONDS = 300   # 5-minute resolution — matches our production default
+STEP_SECONDS = 300
 DAYS         = 8
-N            = DAYS * 24 * 3600 // STEP_SECONDS   # 2304 points
-TRUE_LAG     = 1     # lag in steps (1 × 300s = 5 min)
-LOOKBACK     = 30    # for XGBoost feature window
+N            = DAYS * 24 * 3600 // STEP_SECONDS
+TRUE_LAG     = 1
+LOOKBACK     = 30
 
 rng = np.random.default_rng(42)
 t   = np.arange(N)
-
-
-# ── System metric generators ──────────────────────────────────────────────────
 
 def generate_system_metrics(biz: np.ndarray, lag: int = TRUE_LAG) -> dict:
     n = len(biz)
@@ -77,9 +51,6 @@ def generate_system_metrics(biz: np.ndarray, lag: int = TRUE_LAG) -> dict:
 
     return {"cpu": cpu, "ram_pct": ram_pct, "ram_gb": ram_gb,
             "net": net, "disk": disk}
-
-
-# ── Business metric patterns ──────────────────────────────────────────────────
 
 def pattern_sinusoidal() -> np.ndarray:
     daily  = 50 + 40 * np.sin(2 * np.pi * (t / (24*3600/STEP_SECONDS) - 0.25))
@@ -132,34 +103,18 @@ PATTERNS = {
 }
 
 
-# ── Prophet model ─────────────────────────────────────────────────────────────
-
 def train_prophet(biz_train: np.ndarray, sys_train: np.ndarray,
                   biz_test: np.ndarray) -> np.ndarray:
-    """
-    Train Prophet with biz as regressor, sys as target.
-    Prophet handles:
-      - trend extrapolation (linear/logistic)
-      - daily + weekly seasonality (Fourier series)
-      - external regressors
-
-    The key property: Prophet fits a piecewise linear trend over the
-    training data AND extrapolates it. The external regressor (biz) is
-    modelled as an additive component — if biz grows beyond training
-    range, Prophet should scale the prediction proportionally.
-    """
     base_ts = datetime(2024, 1, 1)
     n_tr = len(biz_train)
     n_te = len(biz_test)
 
-    # Build training dataframe
     df_train = pd.DataFrame({
         "ds": [base_ts + timedelta(seconds=i * STEP_SECONDS) for i in range(n_tr)],
         "y":  sys_train.astype(float),
         "biz": biz_train.astype(float),
     })
 
-    # Build future dataframe (test period)
     df_future = pd.DataFrame({
         "ds":  [base_ts + timedelta(seconds=i * STEP_SECONDS)
                 for i in range(n_tr, n_tr + n_te)],
@@ -171,7 +126,7 @@ def train_prophet(biz_train: np.ndarray, sys_train: np.ndarray,
         weekly_seasonality=True,
         daily_seasonality=True,
         seasonality_mode="additive",
-        changepoint_prior_scale=0.05,   # regularise trend changes
+        changepoint_prior_scale=0.05,
     )
     m.add_regressor("biz")
 
@@ -182,8 +137,6 @@ def train_prophet(biz_train: np.ndarray, sys_train: np.ndarray,
     forecast = m.predict(df_future)
     return forecast["yhat"].values
 
-
-# ── XGBoost model ─────────────────────────────────────────────────────────────
 
 def build_features_xgb(biz: np.ndarray, sys_arr: np.ndarray,
                         tau: int, max_biz_train: float) -> tuple:
@@ -219,7 +172,6 @@ def train_xgb(biz: np.ndarray, sys_arr: np.ndarray,
     max_biz_train = float(biz[:split].max())
     X, y = build_features_xgb(biz, sys_arr, tau, max_biz_train)
 
-    # Align split with feature matrix (LOOKBACK rows dropped)
     feature_split = split - LOOKBACK - 1
     feature_split = max(1, min(feature_split, len(X) - 1))
 
@@ -243,22 +195,8 @@ def train_xgb(biz: np.ndarray, sys_arr: np.ndarray,
     return pred, y_te
 
 
-# ── Hybrid model: Prophet trend + XGBoost residuals ──────────────────────────
-
 def train_hybrid(biz: np.ndarray, sys_arr: np.ndarray,
                  tau: int, split: int) -> tuple:
-    """
-    Residual boosting hybrid:
-      1. Prophet fits global trend + seasonality on training data.
-      2. XGBoost fits the residuals (sys - prophet_trend) on training data.
-      3. At inference: final = prophet_forecast + xgb_residual_forecast.
-
-    Why this works:
-      - Prophet captures the macro trend (extrapolates linearly beyond training range).
-      - XGBoost captures local non-linear patterns in the residuals,
-        which are stationary by construction (trend removed).
-      - XGBoost never needs to extrapolate the trend — Prophet handles that.
-    """
     base_ts   = datetime(2024, 1, 1)
     n_tr      = split
     n_te      = len(biz) - split
@@ -291,16 +229,12 @@ def train_hybrid(biz: np.ndarray, sys_arr: np.ndarray,
         warnings.simplefilter("ignore")
         m.fit(df_train)
 
-    # Predict trend for ALL data (train + test) — this is the extrapolated trend
     forecast_all = m.predict(df_all)
-    prophet_all  = forecast_all["yhat"].values   # shape: (n,)
+    prophet_all  = forecast_all["yhat"].values
 
-    # ── Step 2: compute residuals on training data ────────────────────────────
     residuals_train = sys_arr[:n_tr] - prophet_all[:n_tr]
 
-    # ── Step 3: fit XGBoost on residuals ─────────────────────────────────────
     X, _ = build_features_xgb(biz, sys_arr, tau, max_biz_train)
-    # Build residual target aligned with feature matrix
     res_full = sys_arr - prophet_all
     rows_y_res = [float(res_full[i]) for i in range(LOOKBACK, len(biz) - 1)]
     y_res = np.array(rows_y_res)
@@ -327,27 +261,15 @@ def train_hybrid(biz: np.ndarray, sys_arr: np.ndarray,
     xgb_model.fit(X_tr_s, y_res_tr)
     xgb_residual_pred = xgb_model.predict(X_te_s)
 
-    # ── Step 4: combine ───────────────────────────────────────────────────────
-    # prophet_all[split:] is the extrapolated trend for test period
-    # xgb_residual_pred covers feature_split..end aligned to test
     prophet_te = prophet_all[split: split + len(xgb_residual_pred)]
     final_pred = prophet_te + xgb_residual_pred
 
-    # Align with actual test values
     min_len = min(len(final_pred), len(y_te_actual))
     return final_pred[:min_len], y_te_actual[:min_len]
 
 
-# ── Ridge on same features ────────────────────────────────────────────────────
-
 def train_ridge(biz: np.ndarray, sys_arr: np.ndarray,
                 tau: int, split: int) -> tuple:
-    """
-    Ridge regression on the same ~13 features as XGBoost.
-    Ridge is a linear model → it CAN extrapolate beyond the training range
-    by construction. The question is whether the linear assumption holds
-    well enough for our data.
-    """
     max_biz_train = float(biz[:split].max())
     X, y = build_features_xgb(biz, sys_arr, tau, max_biz_train)
 
@@ -366,26 +288,8 @@ def train_ridge(biz: np.ndarray, sys_arr: np.ndarray,
     pred = model.predict(X_te_s)
     return pred, y_te
 
-
-# ── CombinedRegressor: XGBoost + Ridge fallback ───────────────────────────────
-
 def train_combined(biz: np.ndarray, sys_arr: np.ndarray,
                    tau: int, split: int) -> tuple:
-    """
-    Kaggle-style CombinedRegressor (Telsemeyer 2020):
-
-    At inference time:
-      - If biz is within training range → trust XGBoost (better on known data).
-      - If biz exceeds training max → blend toward Ridge proportionally.
-        alpha = min(1.0, biz_above / max_biz_train)
-        pred  = (1 - alpha) * xgb_pred + alpha * ridge_pred
-
-    The key insight: we don't switch abruptly but blend smoothly.
-    At the training boundary alpha=0 (pure XGBoost).
-    One training-max-width beyond → alpha=1 (pure Ridge).
-
-    Both models trained on the same feature matrix so the blend is coherent.
-    """
     max_biz_train = float(biz[:split].max())
     X, y = build_features_xgb(biz, sys_arr, tau, max_biz_train)
 
@@ -399,7 +303,6 @@ def train_combined(biz: np.ndarray, sys_arr: np.ndarray,
     X_tr_s  = scaler.fit_transform(X_tr)
     X_te_s  = scaler.transform(X_te)
 
-    # Train both models on training data
     if HAS_XGB:
         xgb_model = XGBRegressor(n_estimators=300, max_depth=5, learning_rate=0.05,
                                   subsample=0.8, colsample_bytree=0.8,
@@ -416,47 +319,26 @@ def train_combined(biz: np.ndarray, sys_arr: np.ndarray,
     xgb_pred   = xgb_model.predict(X_te_s)
     ridge_pred = ridge_model.predict(X_te_s)
 
-    # biz_above_max is feature index 11 in our feature matrix (0-indexed)
-    # We can recompute it directly from raw biz values for clarity
     biz_lag = biz.copy()
     if tau > 0:
         biz_lag = np.roll(biz, tau)
         biz_lag[:tau] = biz[0]
 
-    # For each test point compute alpha based on how far biz exceeds training max
     test_indices = range(LOOKBACK + feature_split, LOOKBACK + feature_split + len(X_te))
     alphas = np.zeros(len(X_te))
     for i, idx in enumerate(test_indices):
         if idx < len(biz_lag):
             bl = biz_lag[idx]
             biz_above = max(0.0, bl - max_biz_train)
-            # Smooth blend: alpha goes 0→1 as biz_above goes 0→max_biz_train
             alphas[i] = min(1.0, biz_above / (max_biz_train + 1e-9))
 
-    # Blend: within range → XGBoost, extrapolation → Ridge
     combined_pred = (1.0 - alphas) * xgb_pred + alphas * ridge_pred
 
     return combined_pred, y_te
 
 
-# ── LightGBM with linear_tree ─────────────────────────────────────────────────
-
 def train_lgbm_linear(biz: np.ndarray, sys_arr: np.ndarray,
                       tau: int, split: int) -> tuple:
-    """
-    LightGBM with linear_tree=True.
-
-    Standard GBM builds a tree and assigns the MEAN of training samples
-    to each leaf → constant extrapolation (same as XGBoost).
-
-    With linear_tree=True LightGBM fits a LINEAR MODEL in each leaf instead
-    of averaging. This gives piecewise-linear predictions that can extrapolate
-    beyond the training range — the last leaf continues its fitted slope.
-
-    Requires: pip install lightgbm>=3.2.0
-    Uses the native LightGBM API (not sklearn wrapper) because linear_tree
-    is not exposed through the sklearn interface.
-    """
     try:
         import lightgbm as lgb
     except ImportError:
@@ -480,15 +362,15 @@ def train_lgbm_linear(biz: np.ndarray, sys_arr: np.ndarray,
     params = {
         "objective":         "regression",
         "metric":            "rmse",
-        "linear_tree":       True,   # ← piecewise-linear leaves for extrapolation
-        "num_leaves":        8,      # small — each leaf needs enough points for stable linear fit
-        "min_data_in_leaf":  20,     # minimum points per leaf to stabilise linear regression
+        "linear_tree":       True,
+        "num_leaves":        8,
+        "min_data_in_leaf":  20,
         "learning_rate":     0.05,
         "subsample":         0.8,
         "colsample_bytree":  0.8,
-        "reg_alpha":         0.1,    # L1 on leaf linear models
-        "reg_lambda":        1.0,    # L2 on leaf linear models — critical for stability
-        "linear_lambda":     1.0,    # explicit regularisation for linear models in leaves
+        "reg_alpha":         0.1,
+        "reg_lambda":        1.0,
+        "linear_lambda":     1.0,
         "verbosity":         -1,
         "seed":              42,
     }
@@ -503,8 +385,6 @@ def train_lgbm_linear(biz: np.ndarray, sys_arr: np.ndarray,
     return pred, y_te
 
 
-# ── Find lag ─────────────────────────────────────────────────────────────────
-
 def find_lag(biz: np.ndarray, sys: np.ndarray, max_lag: int = 20) -> int:
     xd, yd = np.diff(biz.astype(float)), np.diff(sys.astype(float))
     best_lag, best = 0, 0.0
@@ -517,8 +397,6 @@ def find_lag(biz: np.ndarray, sys: np.ndarray, max_lag: int = 20) -> int:
             best, best_lag = abs(p), lag
     return best_lag
 
-
-# ── Run one pattern ───────────────────────────────────────────────────────────
 
 def run_pattern(name: str, label: str, biz_fn, target: str = "cpu") -> dict:
     biz     = biz_fn()
@@ -541,7 +419,6 @@ def run_pattern(name: str, label: str, biz_fn, target: str = "cpu") -> dict:
 
     results = {}
 
-    # ── Prophet ──────────────────────────────────────────────────────────────
     t0 = time.time()
     try:
         biz_lag_tr = np.roll(biz[:split], tau);  biz_lag_tr[:tau] = biz[0]
@@ -560,7 +437,6 @@ def run_pattern(name: str, label: str, biz_fn, target: str = "cpu") -> dict:
         print(f"  Prophet  → ERROR: {e}")
         results["prophet"] = {"r2": None, "mae": None, "time": None}
 
-    # ── XGBoost ──────────────────────────────────────────────────────────────
     t0 = time.time()
     try:
         pred_xgb, y_te_xgb = train_xgb(biz, sys_arr, tau, split)
@@ -574,7 +450,6 @@ def run_pattern(name: str, label: str, biz_fn, target: str = "cpu") -> dict:
         print(f"  XGBoost  → ERROR: {e}")
         results["xgboost"] = {"r2": None, "mae": None, "time": None}
 
-    # ── Ridge ─────────────────────────────────────────────────────────────────
     t0 = time.time()
     try:
         pred_r, y_te_r = train_ridge(biz, sys_arr, tau, split)
@@ -588,7 +463,6 @@ def run_pattern(name: str, label: str, biz_fn, target: str = "cpu") -> dict:
         print(f"  Ridge    → ERROR: {e}")
         results["ridge"] = {"r2": None, "mae": None, "time": None}
 
-    # ── Hybrid ───────────────────────────────────────────────────────────────
     t0 = time.time()
     try:
         pred_h, y_te_h = train_hybrid(biz, sys_arr, tau, split)
@@ -602,7 +476,6 @@ def run_pattern(name: str, label: str, biz_fn, target: str = "cpu") -> dict:
         print(f"  Hybrid   → ERROR: {e}")
         results["hybrid"] = {"r2": None, "mae": None, "time": None}
 
-    # ── Combined (XGBoost + Ridge blend) ─────────────────────────────────────
     t0 = time.time()
     try:
         pred_c, y_te_c = train_combined(biz, sys_arr, tau, split)
@@ -616,7 +489,6 @@ def run_pattern(name: str, label: str, biz_fn, target: str = "cpu") -> dict:
         print(f"  Combined → ERROR: {e}")
         results["combined"] = {"r2": None, "mae": None, "time": None}
 
-    # ── LightGBM linear_tree ─────────────────────────────────────────────────
     t0 = time.time()
     try:
         pred_l, y_te_l = train_lgbm_linear(biz, sys_arr, tau, split)
@@ -630,7 +502,6 @@ def run_pattern(name: str, label: str, biz_fn, target: str = "cpu") -> dict:
         print(f"  LGBM-lin → ERROR: {e}")
         results["lgbm"] = {"r2": None, "mae": None, "time": None}
 
-    # Winner across all six
     all_keys = ("prophet", "xgboost", "ridge", "hybrid", "combined", "lgbm")
     scores = {k: results[k]["r2"] for k in all_keys
               if results.get(k, {}).get("r2") is not None}
@@ -648,13 +519,7 @@ def run_pattern(name: str, label: str, biz_fn, target: str = "cpu") -> dict:
     return results
 
 
-# ── Extrapolation test ────────────────────────────────────────────────────────
-
 def test_extrapolation():
-    """
-    Explicitly test extrapolation: train on RPS=0..50, test on RPS=50..150.
-    This is the exact scenario where XGBoost fails and Prophet should shine.
-    """
     print("\n" + "="*70)
     print("  EXTRAPOLATION TEST")
     print("  Train: RPS 0..50  |  Test: RPS 50..150 (never seen in training)")
@@ -663,7 +528,6 @@ def test_extrapolation():
     n_tr = int(N * 0.7)
     n_te = N - n_tr
 
-    # Drifting upward — starts low, grows beyond training range in test
     biz_full = np.clip(
         np.linspace(5, 150, N) + 10 * np.sin(2*np.pi*t/(24*3600/STEP_SECONDS))
         + rng.normal(0, 3, N), 1, 200
@@ -677,7 +541,6 @@ def test_extrapolation():
     print(f"  Test  biz range: [{biz_full[n_tr:].min():.1f}, {biz_full[n_tr:].max():.1f}]")
     print(f"  Lag detected: {tau} steps ({tau*STEP_SECONDS//60} min)\n")
 
-    # Prophet
     try:
         biz_lag = np.roll(biz_full, tau); biz_lag[:tau] = biz_full[0]
         pred_p = train_prophet(biz_lag[:n_tr], sys_full[:n_tr], biz_lag[n_tr:])
@@ -690,7 +553,6 @@ def test_extrapolation():
         print(f"  Prophet  → ERROR: {e}")
         r2_p = None
 
-    # XGBoost
     try:
         pred_x, y_te_x = train_xgb(biz_full, sys_full, tau, n_tr)
         r2_x  = r2_score(y_te_x, pred_x)
@@ -700,7 +562,6 @@ def test_extrapolation():
         print(f"  XGBoost  → ERROR: {e}")
         r2_x = None
 
-    # Ridge
     try:
         pred_r, y_te_r = train_ridge(biz_full, sys_full, tau, n_tr)
         r2_r  = r2_score(y_te_r, pred_r)
@@ -710,7 +571,6 @@ def test_extrapolation():
         print(f"  Ridge    → ERROR: {e}")
         r2_r = None
 
-    # Hybrid
     try:
         pred_h, y_te_h = train_hybrid(biz_full, sys_full, tau, n_tr)
         r2_h  = r2_score(y_te_h, pred_h)
@@ -720,7 +580,6 @@ def test_extrapolation():
         print(f"  Hybrid   → ERROR: {e}")
         r2_h = None
 
-    # Combined
     try:
         pred_c, y_te_c = train_combined(biz_full, sys_full, tau, n_tr)
         r2_c  = r2_score(y_te_c, pred_c)
@@ -730,7 +589,6 @@ def test_extrapolation():
         print(f"  Combined → ERROR: {e}")
         r2_c = None
 
-    # LightGBM linear_tree
     try:
         pred_l, y_te_l = train_lgbm_linear(biz_full, sys_full, tau, n_tr)
         r2_l  = r2_score(y_te_l, pred_l)
@@ -751,8 +609,6 @@ def test_extrapolation():
             marker = " ← baseline" if name == "XGBoost" else f"  ΔvsXGB={delta:+.4f}"
             print(f"  {name:<10} R²={r2_val:+.4f}{marker}")
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Prophet vs XGBoost for load prediction")
@@ -782,7 +638,6 @@ def main():
         r = run_pattern(pname, label, fn, args.target)
         all_results.append((label, r))
 
-    # Summary
     print(f"\n{'='*108}")
     print("  SUMMARY")
     print(f"{'='*108}")

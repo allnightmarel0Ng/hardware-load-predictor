@@ -1,19 +1,3 @@
-"""
-Server Group Manager
-────────────────────────────────────────────────────────────────────────────
-CRUD operations for ServerGroup and Server models.
-
-A ServerGroup is a named cluster of servers that share the same business
-metric formula.  Servers within the group each have their own Prometheus
-endpoint and their own trained model, but they are all driven by the same
-business signal.
-
-Public API consumed by the request handler:
-  create_group / get_group / list_groups / update_group / delete_group
-  add_server / get_server / list_servers / update_server / remove_server
-  provision_group_configs — creates a ForecastingConfig for every active
-                            server in the group (convenience helper)
-"""
 from __future__ import annotations
 
 import logging
@@ -31,8 +15,6 @@ from app.schemas.schemas import (
 
 logger = logging.getLogger(__name__)
 
-
-# ── ServerGroup CRUD ──────────────────────────────────────────────────────────
 
 def create_group(db: Session, data: ServerGroupCreate) -> ServerGroup:
     if db.query(ServerGroup).filter_by(name=data.name).first():
@@ -78,12 +60,9 @@ def delete_group(db: Session, group_id: int) -> None:
     logger.info("Deleted ServerGroup %d", group_id)
 
 
-# ── Server CRUD ───────────────────────────────────────────────────────────────
-
 def add_server(db: Session, group_id: int, data: ServerCreate) -> Server:
     get_group(db, group_id)  # 404 guard
 
-    # Name must be unique within the group
     existing = (
         db.query(Server)
         .filter_by(group_id=group_id, name=data.name)
@@ -139,26 +118,12 @@ def remove_server(db: Session, group_id: int, server_id: int) -> None:
     logger.info("Removed Server %d from group %d", server_id, group_id)
 
 
-# ── Convenience: provision configs ───────────────────────────────────────────
-
 def provision_group_configs(db: Session, group_id: int) -> list[ForecastingConfig]:
-    """
-    Create a ForecastingConfig for every active server in the group that
-    does not already have one.  The config inherits the group's business
-    metric formula and the server's host/port.
-
-    This is called after servers are added to a group so training can be
-    triggered in bulk via POST /groups/{id}/train/.
-
-    Returns the list of newly created configs (skips servers that already
-    have a config).
-    """
     group = get_group(db, group_id)
     servers = list_servers(db, group_id, active_only=True)
     created: list[ForecastingConfig] = []
 
     for server in servers:
-        # Check if a config already exists for this server
         existing = db.query(ForecastingConfig).filter_by(server_id=server.id).first()
         if existing:
             logger.debug(
@@ -168,7 +133,6 @@ def provision_group_configs(db: Session, group_id: int) -> list[ForecastingConfi
             continue
 
         config_name = f"{group.name}::{server.name}"
-        # Name collision guard (e.g. if a legacy config already uses this name)
         if db.query(ForecastingConfig).filter_by(name=config_name).first():
             config_name = f"{group.name}::{server.name}::{server.id}"
 

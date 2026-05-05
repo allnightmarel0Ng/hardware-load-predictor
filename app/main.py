@@ -1,7 +1,3 @@
-"""
-Application entrypoint.
-Creates all DB tables, mounts routers, starts the background scheduler.
-"""
 import logging
 
 from fastapi import FastAPI
@@ -18,7 +14,6 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
 )
 
-# Create tables (use Alembic for migrations in production)
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(

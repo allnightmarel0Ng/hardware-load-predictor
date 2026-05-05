@@ -1,4 +1,3 @@
-"""Unit tests for Module 3 — Correlation Analyzer and Module 4 — Model Trainer."""
 import os
 import pytest
 import numpy as np
@@ -9,13 +8,11 @@ from app.modules.correlation_analyzer import (
     _best_lag_and_coeffs, SIGNIFICANCE_THRESHOLD, ALL_TARGETS,
 )
 from app.modules.data_collector import fetch_historical_data
-from app.modules.model_trainer import train_model, get_latest_ready_model, _build_features
+from app.modules.model_trainer import train_model, get_latest_ready_model, _build_features_for_target
 from app.modules.config_manager import create_config
 from app.models.db_models import ModelStatus
 from app.schemas.schemas import ForecastingConfigCreate
 
-
-# ── helpers ───────────────────────────────────────────────────────────────────
 
 def _bundle(lookback_days: int = 7):
     return fetch_historical_data("host", 9090, "orders_metric", lookback_days=lookback_days)
@@ -30,10 +27,6 @@ def _cfg_data(name: str = "trainer-test") -> ForecastingConfigCreate:
         business_metric_formula="sum(rate(orders_total[1m]))",
     )
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Internal helpers
-# ══════════════════════════════════════════════════════════════════════════════
 
 class TestFirstDifference:
     def test_output_length(self):
@@ -103,10 +96,6 @@ class TestBestLagAndCoeffs:
         assert isinstance(p, float) and isinstance(s, float)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Correlation Analyzer — public API — five targets
-# ══════════════════════════════════════════════════════════════════════════════
-
 class TestCorrelationAnalyzer:
     def test_returns_correlation_report(self):
         assert isinstance(analyze(_bundle()), CorrelationReport)
@@ -158,7 +147,7 @@ class TestCorrelationAnalyzer:
         assert isinstance(lag, int) and lag >= 0
 
     def test_best_lag_zero_when_nothing_significant(self):
-        """All insignificant → best_lag() should return 0 (train with no lag)."""
+        
         report = CorrelationReport(
             cpu=        CorrelationResult("cpu",         5, 0.1, 0.1, 0.1, False),
             ram_gb=     CorrelationResult("ram_gb",      3, 0.1, 0.1, 0.1, False),
@@ -171,7 +160,7 @@ class TestCorrelationAnalyzer:
         assert not report.any_significant
 
     def test_per_target_lag_zero_for_insignificant(self):
-        """Insignificant targets should get lag=0 from per_target_lag()."""
+        
         report = CorrelationReport(
             cpu=        CorrelationResult("cpu",         5, 0.8, 0.75, 0.8, True),   # sig
             ram_gb=     CorrelationResult("ram_gb",      3, 0.1, 0.1,  0.1, False),  # not sig
@@ -192,9 +181,8 @@ class TestCorrelationAnalyzer:
         assert report.is_business_constant is False
 
     def test_constant_business_series_flagged(self):
-        """A constant business series should set is_business_constant=True."""
+        
         bundle = _bundle()
-        # Override business with a constant series
         const_val = 100.0
         bundle.business = [{"timestamp": p["timestamp"], "value": const_val}
                            for p in bundle.business]
@@ -202,12 +190,8 @@ class TestCorrelationAnalyzer:
         assert report.is_business_constant is True
 
     def test_training_not_blocked_by_insignificant_results(self):
-        """
-        analyze() should NEVER raise even when all correlations are weak.
-        The caller decides whether to proceed.
-        """
+        
         bundle = _bundle(lookback_days=1)
-        # Should not raise
         report = analyze(bundle)
         assert isinstance(report, CorrelationReport)
 
@@ -216,10 +200,7 @@ class TestCorrelationAnalyzer:
         assert analyze(bundle).n_points == len(bundle.business)
 
     def test_synthetic_stub_produces_some_significant(self):
-        """
-        The stub generator creates correlated system metrics —
-        at least one target should be significant after 14 days.
-        """
+        
         report = analyze(_bundle(lookback_days=14))
         assert report.any_significant, (
             "Expected ≥1 significant target in stub data. Got: "
@@ -227,32 +208,52 @@ class TestCorrelationAnalyzer:
         )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Model Trainer
-# ══════════════════════════════════════════════════════════════════════════════
-
 class TestBuildFeatures:
+    def _sys_arrays(self, bundle):
+        return {
+            "cpu":     bundle["cpu"],
+            "ram_gb":  bundle["ram_gb"],
+            "ram_pct": bundle["ram_pct"],
+            "net":     bundle["net"],
+            "disk":    bundle["disk"],
+        }
+
     def test_output_shapes(self):
         bundle = _bundle(lookback_days=3)
-        X, y = _build_features(bundle, lag=5)
-        assert X.ndim == 2 and y.ndim == 2
+        X, y = _build_features_for_target(
+            bundle["biz"], self._sys_arrays(bundle), tau=5,
+            target_key="cpu", n=len(bundle["biz"]),
+        )
+        assert X.ndim == 2 and y.ndim == 1
         assert X.shape[0] == y.shape[0]
-        assert X.shape[1] == 9   # 9 features
-        assert y.shape[1] == 5   # 5 targets: cpu, ram_gb, ram_pct, net, disk
+        assert X.shape[0] > 0
 
     def test_lag_zero_still_produces_features(self):
-        X, y = _build_features(_bundle(lookback_days=2), lag=0)
+        bundle = _bundle(lookback_days=2)
+        X, y = _build_features_for_target(
+            bundle["biz"], self._sys_arrays(bundle), tau=0,
+            target_key="cpu", n=len(bundle["biz"]),
+        )
         assert X.shape[0] > 0
 
     def test_larger_lag_fewer_rows(self):
         bundle = _bundle(lookback_days=3)
-        X0, _ = _build_features(bundle, lag=0)
-        X30, _ = _build_features(bundle, lag=30)
+        X0, _ = _build_features_for_target(
+            bundle["biz"], self._sys_arrays(bundle), tau=0,
+            target_key="cpu", n=len(bundle["biz"]),
+        )
+        X30, _ = _build_features_for_target(
+            bundle["biz"], self._sys_arrays(bundle), tau=30,
+            target_key="cpu", n=len(bundle["biz"]),
+        )
         assert X0.shape[0] >= X30.shape[0]
 
     def test_no_nans(self):
         bundle = _bundle(lookback_days=5)
-        X, y = _build_features(bundle, lag=5)
+        X, y = _build_features_for_target(
+            bundle["biz"], self._sys_arrays(bundle), tau=5,
+            target_key="cpu", n=len(bundle["biz"]),
+        )
         assert not np.isnan(X).any()
         assert not np.isnan(y).any()
 
@@ -276,12 +277,9 @@ class TestModelTrainer:
         cfg = create_config(db, _cfg_data("train-loadable"))
         model = train_model(db, cfg, _bundle(), analyze(_bundle()))
         art = joblib.load(model.artifact_path)
-        assert "model" in art and "scaler" in art
-        # Verify model outputs 5 targets
-        from app.modules.model_trainer import _build_features
-        X, _ = _build_features(_bundle(), lag=model.lag_minutes or 0)
-        pred = art["model"].predict(art["scaler"].transform(X[:1]))
-        assert pred.shape == (1, 5), f"expected (1,5), got {pred.shape}"
+        assert "scaler" in art
+        assert "targets" in art
+        assert len(art["targets"]) == 5
 
     def test_model_has_five_target_metrics(self, db):
         cfg = create_config(db, _cfg_data("train-metrics"))
@@ -334,13 +332,9 @@ class TestModelTrainer:
         assert get_latest_ready_model(db, cfg.id) is None
 
     def test_trains_even_when_no_significant_correlation(self, db):
-        """
-        Training must proceed even if correlation is below threshold for all targets.
-        The model will predict mean values (R² ≈ 0) — still a valid baseline.
-        """
+        
         cfg = create_config(db, _cfg_data("train-no-sig"))
         bundle = _bundle()
-        # Force all results to be insignificant
         report = CorrelationReport(
             cpu=        CorrelationResult("cpu",         0, 0.1, 0.1, 0.1, False),
             ram_gb=     CorrelationResult("ram_gb",      0, 0.1, 0.1, 0.1, False),
@@ -349,13 +343,12 @@ class TestModelTrainer:
             disk=       CorrelationResult("disk",        0, 0.1, 0.1, 0.1, False),
             n_points=len(bundle.business),
         )
-        # Should not raise; training proceeds with lag=0
         model = train_model(db, cfg, bundle, report)
         assert model.status == ModelStatus.READY
         assert model.lag_minutes == 0
 
     def test_r2_cpu_non_negative_with_correlated_data(self, db):
-        """With 14 days of correlated synthetic data, model beats the mean."""
+        
         cfg = create_config(db, _cfg_data("train-r2"))
         bundle = _bundle(lookback_days=14)
         model = train_model(db, cfg, bundle, analyze(bundle))

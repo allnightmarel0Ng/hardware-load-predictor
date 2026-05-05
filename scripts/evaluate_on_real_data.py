@@ -1,50 +1,3 @@
-"""
-evaluate_on_real_data.py
-─────────────────────────────────────────────────────────────────────────────
-Evaluates the hardware-load-predictor ML pipeline against real production
-datacenter traces instead of synthetic stub data.
-
-Datasets used (both freely downloadable, CC-BY 4.0):
-
-  [A] Alibaba 2018 machine usage — 8 days, 300-second granularity
-      cpu_util_percent, mem_util_percent, net_in, net_out
-      Download (202 KB):
-      https://zenodo.org/records/14564935/files/machine_usage_days_1_to_8_grouped_300_seconds.csv?download=1
-
-  [B] Google 2019 instance usage — 1 month, 300-second granularity
-      avg_cpu, avg_mem, avg_assigned_mem, avg_cycles_per_instruction
-      Download (607 KB):
-      https://zenodo.org/records/14564935/files/instance_usage_grouped_300_seconds_month.csv?download=1
-
-Why these datasets?
-  Both are pre-processed aggregates of real production clusters (Alibaba Borg
-  co-location cluster; Google's internal Borg scheduler). They contain real
-  noise, daily seasonality, load spikes, and multi-modal CPU distributions
-  that synthetic sine-wave data cannot replicate.
-
-Why no "business metric" in these files?
-  No public dataset pairs application-level business metrics (orders/min,
-  HTTP RPS) with server resource utilisation simultaneously — companies do
-  not release both together for confidentiality reasons. The standard
-  academic approach (used in workload prediction literature) is to construct
-  a synthetic business proxy from the real system metrics, then evaluate
-  whether the model recovers the known lag and predicts the real values.
-
-  Business metric construction used here:
-      business(t) = cpu_util(t - LAG_MINUTES) / COEFF + noise
-  This inverts the ground-truth relationship, giving a realistic input that
-  is causally prior to the CPU signal by a known lag. Evaluation is then
-  against REAL cpu/mem/net values — not another synthetic series.
-
-Usage:
-  1. Download the two CSV files into this scripts/ directory (or pass --data-dir)
-  2. pip install numpy scikit-learn pandas joblib
-  3. python scripts/evaluate_on_real_data.py
-
-  Or to run only one dataset:
-      python scripts/evaluate_on_real_data.py --dataset alibaba
-      python scripts/evaluate_on_real_data.py --dataset google
-"""
 from __future__ import annotations
 
 import argparse
@@ -57,14 +10,11 @@ from typing import NamedTuple
 import numpy as np
 import pandas as pd
 
-# ── allow running from repo root ──────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.modules.correlation_analyzer import analyze, CorrelationReport
 from app.modules.model_trainer import _build_features, _fit_and_evaluate, _compute_metrics
 from app.modules.data_collector import MetricsBundle
-
-# ── constants ─────────────────────────────────────────────────────────────────
 
 ALIBABA_FILE = "machine_usage_days_1_to_8_grouped_300_seconds.csv"
 GOOGLE_FILE  = "instance_usage_grouped_300_seconds_month.csv"

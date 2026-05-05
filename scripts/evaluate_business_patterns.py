@@ -1,40 +1,3 @@
-"""
-evaluate_business_patterns.py
-─────────────────────────────────────────────────────────────────────────────
-Evaluates the ML pipeline across five fundamentally different business metric
-patterns using REAL system metrics from public datacenter traces.
-
-System metrics (CPU, RAM, network, disk) come from:
-  [A] Alibaba 2018 machine usage trace — 8 days, 300-second granularity
-      Download (~202 KB):
-      curl -L 'https://zenodo.org/records/14564935/files/machine_usage_days_1_to_8_grouped_300_seconds.csv?download=1' \
-           -o scripts/machine_usage_days_1_to_8_grouped_300_seconds.csv
-
-  [B] Google 2019 instance usage trace — 1 month, 300-second granularity
-      Download (~607 KB):
-      curl -L 'https://zenodo.org/records/14564935/files/instance_usage_grouped_300_seconds_month.csv?download=1' \
-           -o scripts/instance_usage_grouped_300_seconds_month.csv
-
-Business metric patterns (all synthetic, built from real CPU with known lag):
-  1. sinusoidal  — smooth daily waves (SaaS / consumer app)
-  2. step        — abrupt level changes (batch jobs, ETL)
-  3. spiky       — low background + sharp bursts (event-driven)
-  4. drifting    — slow upward trend (growing audience)
-  5. multimodal  — weekday / weekend split (B2B corporate)
-
-Why synthetic business metric?
-  No public dataset pairs application-level business metrics (RPS, orders/min)
-  with server resource utilisation — companies don't release both together.
-  Standard approach in workload prediction literature: construct a causal
-  business proxy from real CPU with a known lag, then evaluate whether the
-  pipeline recovers that lag and predicts the REAL system values.
-
-Usage:
-    python scripts/evaluate_business_patterns.py
-    python scripts/evaluate_business_patterns.py --dataset google
-    python scripts/evaluate_business_patterns.py --pattern spiky
-    python scripts/evaluate_business_patterns.py --lag 10
-"""
 from __future__ import annotations
 
 import argparse
@@ -53,7 +16,6 @@ from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.preprocessing import StandardScaler
 
-# ── Dataset file names & URLs ─────────────────────────────────────────────────
 SCRIPTS_DIR  = Path(__file__).parent
 ALIBABA_FILE = SCRIPTS_DIR / "machine_usage_days_1_to_8_grouped_300_seconds.csv"
 GOOGLE_FILE  = SCRIPTS_DIR / "instance_usage_grouped_300_seconds_month.csv"
@@ -62,23 +24,13 @@ ALIBABA_URL  = ("https://zenodo.org/records/14564935/files/"
 GOOGLE_URL   = ("https://zenodo.org/records/14564935/files/"
                 "instance_usage_grouped_300_seconds_month.csv?download=1")
 
-STEP_SECONDS = 300          # both datasets use 5-minute intervals
-TRUE_LAG     = 1            # 1 step × 300 s = 5 minutes
+STEP_SECONDS = 300
+TRUE_LAG     = 1
 SIGNIFICANCE  = 0.6
 
 rng = np.random.default_rng(42)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 1. DATASET LOADERS
-# ══════════════════════════════════════════════════════════════════════════════
-
 def load_alibaba() -> dict[str, np.ndarray]:
-    """
-    Alibaba 2018 machine_usage — no header, columns:
-        cpu_util_percent, mem_util_percent, net_in, net_out, disk_io_percent
-    Invalid sentinel values (-1, 101) → forward-filled.
-    """
     if not ALIBABA_FILE.exists():
         raise FileNotFoundError(
             f"Alibaba dataset not found: {ALIBABA_FILE}\n"
@@ -103,12 +55,6 @@ def load_alibaba() -> dict[str, np.ndarray]:
 
 
 def load_google() -> dict[str, np.ndarray]:
-    """
-    Google 2019 instance_usage — has header:
-        avg_cpu [0,1], avg_mem [0,1], avg_assigned_mem [0,1],
-        avg_cycles_per_instruction
-    Scale to [0,100].
-    """
     if not GOOGLE_FILE.exists():
         raise FileNotFoundError(
             f"Google dataset not found: {GOOGLE_FILE}\n"
@@ -117,8 +63,6 @@ def load_google() -> dict[str, np.ndarray]:
     df = pd.read_csv(GOOGLE_FILE)
     cpu     = (df["avg_cpu"] * 100).clip(0, 99)
     mem_pct = (df["avg_mem"] * 100).clip(0, 99)
-    # Network: derived from CPU with realistic proportionality + noise
-    # (CPI is not a network proxy — it reflects compute intensity, not I/O)
     cpu_arr = cpu.to_numpy(float)
     net     = pd.Series(np.clip(8 + 0.7 * cpu_arr + rng.normal(0, 5, len(cpu_arr)), 0, 400))
     disk    = pd.Series(np.clip(5 + 0.25 * cpu_arr + rng.normal(0, 4, len(cpu_arr)), 0, 80))
@@ -137,15 +81,8 @@ def load_google() -> dict[str, np.ndarray]:
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 2. BUSINESS METRIC PATTERN GENERATORS
-#    Each takes real CPU array and embeds a known lag by constructing
-#    a business proxy that causally precedes the CPU signal.
-# ══════════════════════════════════════════════════════════════════════════════
-
 def _cpu_to_proxy(cpu: np.ndarray, lag: int, coeff: float = 0.5,
                   noise_std: float = 2.0) -> np.ndarray:
-    """Base: invert the CPU→business relationship with a known lag."""
     n = len(cpu)
     shifted = np.empty(n)
     shifted[:n - lag] = cpu[lag:]
@@ -155,7 +92,6 @@ def _cpu_to_proxy(cpu: np.ndarray, lag: int, coeff: float = 0.5,
 
 
 def pattern_sinusoidal(cpu: np.ndarray, lag: int) -> np.ndarray:
-    """Smooth daily waves — business proxy modulated by a daily sinusoid."""
     n = len(cpu)
     t = np.arange(n)
     base  = _cpu_to_proxy(cpu, lag)
@@ -165,19 +101,15 @@ def pattern_sinusoidal(cpu: np.ndarray, lag: int) -> np.ndarray:
 
 
 def pattern_step(cpu: np.ndarray, lag: int) -> np.ndarray:
-    """Abrupt level changes — quantise the proxy into discrete steps."""
     base = _cpu_to_proxy(cpu, lag)
-    # Quantise into 4 levels using percentile boundaries
     p25, p50, p75 = np.percentile(base, [25, 50, 75])
     stepped = np.where(base < p25, p25 * 0.5,
               np.where(base < p50, p25,
               np.where(base < p75, p50, p75 * 1.3)))
-    # Smooth within each plateau (hold + small noise), keep hard edges
     return np.clip(stepped + rng.normal(0, 1.5, len(cpu)), 0.5, 300)
 
 
 def pattern_spiky(cpu: np.ndarray, lag: int) -> np.ndarray:
-    """Low background + sharp Gaussian bursts on top of real CPU signal."""
     n    = len(cpu)
     t    = np.arange(n)
     base = _cpu_to_proxy(cpu, lag, coeff=0.8)
@@ -193,7 +125,6 @@ def pattern_spiky(cpu: np.ndarray, lag: int) -> np.ndarray:
 
 
 def pattern_drifting(cpu: np.ndarray, lag: int) -> np.ndarray:
-    """Slow upward trend — multiply proxy by a linearly growing factor."""
     n    = len(cpu)
     base = _cpu_to_proxy(cpu, lag)
     trend = np.linspace(0.6, 1.4, n)   # 60% → 140% of baseline over the period
@@ -201,7 +132,6 @@ def pattern_drifting(cpu: np.ndarray, lag: int) -> np.ndarray:
 
 
 def pattern_multimodal(cpu: np.ndarray, lag: int) -> np.ndarray:
-    """Weekday/weekend split — suppress proxy on weekend days."""
     n   = len(cpu)
     t   = np.arange(n)
     base = _cpu_to_proxy(cpu, lag)
@@ -221,10 +151,6 @@ PATTERNS = {
     "multimodal": ("Multimodal (weekday/weekend split)", pattern_multimodal),
 }
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 3. CORRELATION ANALYSIS
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _pearson(a, b):
     if len(a) < 3: return 0.0
@@ -247,10 +173,6 @@ def find_lag(biz, sys, max_lag=20):
     r = max(abs(p), abs(s))
     return best_lag, p, s, r, r >= SIGNIFICANCE
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 4. FEATURE ENGINEERING + TRAINING
-# ══════════════════════════════════════════════════════════════════════════════
 
 def build_features(biz, sys_metrics, tau):
     LOOKBACK = 30
@@ -313,10 +235,6 @@ def train_evaluate(X, y):
     return r2s, maes, mape_cpu, mape_net, mape_avg, algo, len(Xtr), len(Xte)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 5. RUNNER
-# ══════════════════════════════════════════════════════════════════════════════
-
 def run(ds: dict, pattern_name: str, label: str,
         biz_fn: callable, lag: int) -> dict:
     biz = biz_fn(ds["cpu"], lag)
@@ -363,10 +281,6 @@ def run(ds: dict, pattern_name: str, label: str,
                 r2_cpu=r2s["cpu"], r2_net=r2s["net"], r2_ram=r2s["ram_pct"],
                 mape=mape_avg, lag_ok=lag_ok, verdict=verdict)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 6. MAIN
-# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     parser = argparse.ArgumentParser()

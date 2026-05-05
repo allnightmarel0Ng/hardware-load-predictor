@@ -1,22 +1,3 @@
-"""
-Job Runner — async training execution
-──────────────────────────────────────────────────────────────────────────────
-Runs training jobs in a ThreadPoolExecutor so POST /train/ returns immediately
-with a 202 + job_id rather than blocking for 10-30 seconds.
-
-Lifecycle:
-  1. POST /configs/{id}/train/ → creates TrainingJob(QUEUED) → returns job_id
-  2. Worker thread picks it up:
-       QUEUED → RUNNING  (sets started_at)
-       RUNNING → DONE    (sets finished_at, model_id)
-       RUNNING → FAILED  (sets finished_at, error_message)
-  3. GET /jobs/{job_id} → polls status
-
-Thread safety:
-  Each worker thread creates its own DB session (SessionLocal()) so there is
-  no session sharing across threads.  The executor is a module-level singleton
-  started at app startup and shut down at app shutdown.
-"""
 from __future__ import annotations
 
 import logging
@@ -26,14 +7,15 @@ from datetime import datetime
 
 from app.core.database import SessionLocal
 from app.models.db_models import ForecastingConfig, JobStatus, TrainingJob
+from app.modules.data_collector import fetch_historical_data
+from app.modules.correlation_analyzer import analyze
+from app.modules.model_trainer import train_model
 
 logger = logging.getLogger(__name__)
 
 _executor: ThreadPoolExecutor | None = None
 MAX_WORKERS = 4
 
-
-# ── Executor lifecycle ────────────────────────────────────────────────────────
 
 def start_executor() -> None:
     global _executor
@@ -50,19 +32,7 @@ def stop_executor() -> None:
         _executor = None
 
 
-# ── Worker function ───────────────────────────────────────────────────────────
-
 def _run_training_job(job_id: int) -> None:
-    """
-    Executed inside a worker thread.  Each step uses a fresh DB session.
-    Import cycle avoided: model_trainer / correlation_analyzer / data_collector
-    are imported lazily inside the function.
-    """
-    # Lazy imports to avoid circular dependencies
-    from app.modules.data_collector import fetch_historical_data
-    from app.modules.correlation_analyzer import analyze
-    from app.modules.model_trainer import train_model
-
     db = SessionLocal()
     try:
         job = db.get(TrainingJob, job_id)
@@ -70,7 +40,6 @@ def _run_training_job(job_id: int) -> None:
             logger.error("Job %d not found in DB", job_id)
             return
 
-        # Mark running
         job.status     = JobStatus.RUNNING
         job.started_at = datetime.utcnow()
         db.commit()
@@ -81,7 +50,6 @@ def _run_training_job(job_id: int) -> None:
         if not config:
             raise RuntimeError(f"Config {job.config_id} not found.")
 
-        # Full training pipeline
         bundle = fetch_historical_data(
             host=config.host,
             port=config.port,
@@ -97,7 +65,6 @@ def _run_training_job(job_id: int) -> None:
             )
         model = train_model(db, config, bundle, report)
 
-        # Mark done
         job.status      = JobStatus.DONE
         job.model_id    = model.id
         job.finished_at = datetime.utcnow()
@@ -125,13 +92,7 @@ def _run_training_job(job_id: int) -> None:
         db.close()
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
-
 def submit_training_job(config_id: int, lookback_days: int) -> TrainingJob:
-    """
-    Create a TrainingJob record (QUEUED) and submit it to the executor.
-    Returns the job record immediately — caller gets the job_id for polling.
-    """
     db = SessionLocal()
     try:
         job = TrainingJob(
@@ -157,7 +118,6 @@ def submit_training_job(config_id: int, lookback_days: int) -> TrainingJob:
 
 
 def get_job(job_id: int) -> TrainingJob | None:
-    """Fetch a job by ID. Returns None if not found."""
     db = SessionLocal()
     try:
         return db.get(TrainingJob, job_id)
@@ -166,7 +126,6 @@ def get_job(job_id: int) -> TrainingJob | None:
 
 
 def list_jobs(config_id: int, limit: int = 20) -> list[TrainingJob]:
-    """List recent jobs for a config, newest first."""
     db = SessionLocal()
     try:
         return (

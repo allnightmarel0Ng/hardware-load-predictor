@@ -1,9 +1,3 @@
-"""initial schema — all tables
-
-Revision ID: 0001_initial
-Revises:
-Create Date: 2026-03-30
-"""
 from typing import Sequence, Union
 
 import sqlalchemy as sa
@@ -16,7 +10,6 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # ── forecasting_configs ───────────────────────────────────────────────────
     op.create_table(
         "forecasting_configs",
         sa.Column("id",                     sa.Integer(),     nullable=False),
@@ -32,7 +25,6 @@ def upgrade() -> None:
     )
     op.create_index("ix_forecasting_configs_id", "forecasting_configs", ["id"])
 
-    # ── trained_models ────────────────────────────────────────────────────────
     op.create_table(
         "trained_models",
         sa.Column("id",           sa.Integer(),    nullable=False),
@@ -53,7 +45,6 @@ def upgrade() -> None:
     op.create_index("ix_trained_models_id",        "trained_models", ["id"])
     op.create_index("ix_trained_models_config_id", "trained_models", ["config_id"])
 
-    # ── forecast_results ──────────────────────────────────────────────────────
     op.create_table(
         "forecast_results",
         sa.Column("id",                    sa.Integer(), nullable=False),
@@ -76,7 +67,6 @@ def upgrade() -> None:
     op.create_index("ix_forecast_results_config_id", "forecast_results", ["config_id"])
     op.create_index("ix_forecast_results_model_id",  "forecast_results", ["model_id"])
 
-    # ── model_evaluations ─────────────────────────────────────────────────────
     op.create_table(
         "model_evaluations",
         sa.Column("id",               sa.Integer(), nullable=False),
@@ -105,7 +95,6 @@ def upgrade() -> None:
     op.create_index("ix_model_evaluations_model_id",  "model_evaluations", ["model_id"])
     op.create_index("ix_model_evaluations_config_id", "model_evaluations", ["config_id"])
 
-    # ── training_jobs ─────────────────────────────────────────────────────────
     op.create_table(
         "training_jobs",
         sa.Column("id",            sa.Integer(),  nullable=False),

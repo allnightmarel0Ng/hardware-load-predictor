@@ -1,33 +1,3 @@
-"""
-Module 4 — Model Trainer  (v3: per-target adaptive models)
-
-Key changes from v2:
-  - Per-target models: five independent models, one per system metric.
-  - Per-target lag: lag is found individually for each target from
-    correlation analysis on the training split only (first 80%).
-  - Adaptive model selection based on r* and rel_std:
-      r* ≥ 0.7  → XGBoost + extrapolation tail  strong correlation
-      r* ≥ 0.5  → GBR     + extrapolation tail  moderate correlation
-      r* ≥ 0.3  → Ridge                          weak signal
-      r* < 0.3  → Ridge                          very weak signal
-      rel_std < 0.05 or > 2.0 → mean baseline    constant / pure noise
-
-  Extrapolation beyond training range (biz > max_biz_train):
-    Tree models (XGBoost, GBR) return a constant at the edge of training
-    data — they cannot extrapolate. To handle unseen high-load scenarios,
-    we fit an additional Ridge model on the top-30% of training data and
-    compute its slope (d_sys/d_biz). At inference, if biz > max_biz_train:
-      pred = boundary_pred + slope * (biz - max_biz_train)
-    where boundary_pred is the tree model's prediction at max_biz_train.
-    This gives physically meaningful linear extrapolation beyond the
-    training envelope for any r* value.
-  - Advanced per-target features:
-      CPU:  EWMA (α=0.1/0.3/0.7), CV, exceed_70, slope
-      RAM:  release_speed, retention, steps_since_low, rel_to_30
-      Net:  burst_ratio, acceleration, Hurst exponent, local_max count
-      Disk: EWMA inertia, slope60, exceed_80, median_crosses
-  - Artifact now stores a dict of five models + scalers keyed by target name.
-"""
 from __future__ import annotations
 
 import logging
@@ -42,6 +12,7 @@ from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from xgboost import XGBRegressor
 from sklearn.pipeline import Pipeline
 from sqlalchemy.orm import Session
 
@@ -53,16 +24,16 @@ from app.modules.data_collector import MetricsBundle
 logger = logging.getLogger(__name__)
 
 LOOKBACK          = 30
-N_BIZ_FEATURES    = 14   # biz+time features before AR block (used for biz-only Ridge)
+N_BIZ_FEATURES    = 14
+BIZ_ONLY_IDXS     = [0,1,2,3,4,5,6,7,8,9,12,13]
 TEST_SPLIT_RATIO  = 0.20
 TRAIN_RATIO       = 1.0 - TEST_SPLIT_RATIO
 
-# Adaptive model thresholds
-CORR_LOW    = 0.3   # below this → mean_baseline (too weak to model)
-CORR_MEDIUM = 0.5   # r* ≥ 0.5 → GBR; 0.3..0.5 → Ridge
-CORR_HIGH   = 0.7   # r* ≥ 0.7 → XGBoost
-REL_STD_MIN = 0.05   # below this → metric is nearly constant → mean baseline
-REL_STD_MAX = 2.0    # above this → metric is pure noise → mean baseline
+CORR_LOW    = 0.3
+CORR_MEDIUM = 0.5
+CORR_HIGH   = 0.7
+REL_STD_MIN = 0.05
+REL_STD_MAX = 2.0
 
 TARGET_KEYS = ["cpu", "ram_gb", "ram_pct", "net", "disk"]
 
@@ -84,8 +55,6 @@ PARAM_GRID_RIDGE_POLY = [
 ]
 
 
-# ── Artifact path helpers ─────────────────────────────────────────────────────
-
 def _artifact_path(config_id: int, version: int) -> str:
     directory = Path(settings.model_storage_path) / str(config_id)
     directory.mkdir(parents=True, exist_ok=True)
@@ -101,8 +70,6 @@ def _next_version(db: Session, config_id: int) -> int:
     )
     return (latest.version + 1) if latest else 1
 
-
-# ── Correlation helpers (inline — no DB dependency) ───────────────────────────
 
 def _pearson(a: np.ndarray, b: np.ndarray) -> float:
     if len(a) < 3 or a.std() < 1e-9 or b.std() < 1e-9:
@@ -126,10 +93,6 @@ def _find_lag_and_corr(
     sys_train: np.ndarray,
     max_lag: int = 20,
 ) -> tuple[int, float]:
-    """
-    Find optimal lag and r* on the training split only.
-    Returns (best_lag_steps, r_star).
-    """
     xd = np.diff(biz_train.astype(float))
     yd = np.diff(sys_train.astype(float))
     best_lag, best_score = 0, 0.0
@@ -143,35 +106,19 @@ def _find_lag_and_corr(
     return best_lag, r
 
 
-# ── Adaptive model selection ──────────────────────────────────────────────────
-
 def _select_model_type(r: float, rel_std: float) -> str:
-    """
-    Choose algorithm based on correlation strength and metric variance.
-    Returns one of: 'xgboost', 'gbr', 'ridge', 'mean_baseline'.
-
-    xgboost = XGBoost for strong correlations (r* ≥ 0.7).
-    gbr     = GBR for moderate correlations (r* ≥ 0.5).
-    ridge   = Ridge for weak signal (r* < 0.5).
-
-    All non-baseline models get an extrapolation tail fitted separately
-    (see _fit_extrapolation_tail). The tail is used at inference when
-    biz exceeds max_biz_train.
-    """
     if rel_std < REL_STD_MIN:
-        return "mean_baseline"   # nearly constant — predicting mean is optimal
+        return "mean_baseline"
     if rel_std > REL_STD_MAX:
-        return "mean_baseline"   # pure noise — no model can beat the mean
+        return "mean_baseline"
     if r < CORR_LOW:
-        return "mean_baseline"   # too weak to model — mean is more honest
+        return "mean_baseline"
     if r >= CORR_HIGH:
         return "xgboost"
     if r >= CORR_MEDIUM:
         return "gbr"
-    return "ridge"              # Ridge: weak-moderate signal, extrapolates OK
+    return "ridge"
 
-
-# ── Advanced per-target feature helpers ──────────────────────────────────────
 
 def _ewma(arr: np.ndarray, alpha: float) -> np.ndarray:
     result = np.zeros_like(arr)
@@ -209,10 +156,6 @@ def _target_extra_features(
     target_key: str,
     hist: np.ndarray,
 ) -> list[float]:
-    """
-    Six extra features specific to each target metric.
-    hist = all values up to current index (at least LOOKBACK points).
-    """
     if len(hist) < LOOKBACK:
         return [0.0] * 6
 
@@ -249,7 +192,6 @@ def _target_extra_features(
         )
         return [burst, acc, hurst, float(lmax), 0.0, 0.0]
 
-    # disk
     ewma_slow = float(_ewma(hist, 0.05)[-1])
     ewma_fast = float(_ewma(hist, 0.5)[-1])
     inertia   = ewma_slow - ewma_fast
@@ -264,8 +206,6 @@ def _target_extra_features(
     return [inertia, slope60, exc80, float(crosses), 0.0, 0.0]
 
 
-# ── Feature engineering (per target) ─────────────────────────────────────────
-
 def _build_features_for_target(
     biz: np.ndarray,
     sys_arrays: dict[str, np.ndarray],
@@ -275,25 +215,13 @@ def _build_features_for_target(
     max_biz_train: float | None = None,
     step_seconds: int = 60,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Build feature matrix X and target vector y for one system metric.
-    X shape: (n - LOOKBACK - 1, n_features)
-
-    max_biz_train: maximum business metric value seen in training data.
-        Used to compute biz_above_max = max(0, biz[i] - max_biz_train),
-        which gives XGBoost a linear extrapolation signal beyond the
-        training range. At inference with unseen high RPS, this feature
-        is nonzero and lets the model extrapolate proportionally.
-    """
     target_arr = sys_arrays[target_key]
     rows_X: list[list[float]] = []
     rows_y: list[float] = []
 
-    ts_base = datetime(2000, 1, 1)   # dummy base; only hour/dow matter
+    ts_base = datetime(2000, 1, 1)
 
     for i in range(LOOKBACK, n - 1):
-        # ── Time features ──────────────────────────────────────────────────
-        # Use actual step_seconds so hour/dow reflect real elapsed time
         elapsed_min = i * step_seconds / 60.0
         hour   = elapsed_min % (24 * 60) / 60.0
         dow    = (elapsed_min / (24 * 60.0)) % 7
@@ -303,7 +231,6 @@ def _build_features_for_target(
         cos_d  = math.cos(2 * math.pi * dow  / 7)
         trend  = i / n
 
-        # ── Business features ──────────────────────────────────────────────
         bl     = biz[i - tau] if i >= tau else biz[0]
         rm30   = biz[max(0, i - 30):i].mean()
         bn     = bl / (rm30 + 1e-9)
@@ -312,10 +239,6 @@ def _build_features_for_target(
         mu5_b  = biz[max(0, i - 5):i].mean()
         bz     = (biz[i] - mu5_b) / (biz[max(0, i - 5):i].std() + 1e-9)
 
-        # biz_above_max: absolute excess above training maximum (0 during training).
-        # biz_relative:  ratio biz/max_train (≤1 during training, >1 at inference
-        #                with unseen high RPS). Both give XGBoost linear extrapolation
-        #                handles beyond the training range.
         biz_above_max  = max(0.0, bl - max_biz_train) if max_biz_train is not None else 0.0
         biz_relative   = bl / (max_biz_train + 1e-9)  if max_biz_train is not None else 1.0
 
@@ -325,7 +248,6 @@ def _build_features_for_target(
             biz_above_max, biz_relative,
         ]
 
-        # ── Autoregressive system features (all four AR metrics) ───────────
         for key in ("cpu", "ram_pct", "net", "disk"):
             arr = sys_arrays[key]
             l1  = arr[i - 1]
@@ -338,7 +260,6 @@ def _build_features_for_target(
             s15 = arr[max(0, i - 15):i].std() + 1e-9
             feats.extend([l1, l2, l3, m5, m15, m30, s5, s15])
 
-        # ── Target-specific extra features ─────────────────────────────────
         feats.extend(_target_extra_features(target_key, target_arr[:i]))
 
         rows_X.append(feats)
@@ -348,8 +269,6 @@ def _build_features_for_target(
     y = np.array(rows_y, dtype=float)
     return X, y
 
-
-# ── Model building & temporal CV ─────────────────────────────────────────────
 
 def _make_estimator(model_type: str, params: dict):
     if model_type == "xgboost":
@@ -362,23 +281,11 @@ def _make_estimator(model_type: str, params: dict):
 
 
 def _fit_extrapolation_ridge(
-    X_tv_s: np.ndarray,     # scaled feature matrix (after main StandardScaler)
+    X_tv_s: np.ndarray,
     y_tv: np.ndarray,
     biz_values: np.ndarray,
     max_biz_train: float,
 ) -> dict:
-    """
-    Fit two dedicated Ridge models for use when biz > max_biz_train.
-
-    biz_only_ridge: trained on RAW (unscaled) biz+time features with its
-      own StandardScaler. Using raw features is critical — in the scaled
-      space the main scaler can flip the sign of biz (because high-biz
-      periods are underrepresented vs idle periods), causing Ridge to learn
-      a negative slope. In raw space the true positive biz→sys relationship
-      is preserved.
-
-    extrap_ridge: trained on all scaled features, used for live extrapolation.
-    """
     n = len(biz_values)
     fallback = {
         "biz_only_ridge":  None,
@@ -389,18 +296,13 @@ def _fit_extrapolation_ridge(
     if n < 20 or max_biz_train <= 0:
         return fallback
 
-    # ── Biz-only Ridge on already-scaled features ─────────────────────────
-    # Use X_tv_s (scaled by main scaler) sliced to biz+time features only.
-    # No separate scaler — main scaler is reused at inference via X_sc[:, :N_BIZ_FEATURES].
-    X_biz_s = X_tv_s[:, :N_BIZ_FEATURES]
+    X_biz_s = X_tv_s[:, BIZ_ONLY_IDXS]
     biz_only_ridge = Ridge(alpha=1.0)
     biz_only_ridge.fit(X_biz_s, y_tv)
 
-    # ── Full-feature Ridge on scaled features ─────────────────────────────
     extrap_ridge = Ridge(alpha=1.0)
     extrap_ridge.fit(X_tv_s, y_tv)
 
-    # ── Boundary prediction ───────────────────────────────────────────────
     threshold = np.percentile(biz_values, 70)
     mask = biz_values >= threshold
     boundary_pred = float(y_tv[mask].mean()) if mask.sum() >= 5 else float(y_tv.mean())
@@ -417,26 +319,11 @@ def _fit_extrapolation_ridge(
 
 
 def _compute_sample_weights(biz: np.ndarray) -> np.ndarray:
-    """
-    Compute sample weights based on business metric value.
-
-    Points where traffic is near zero (< 5% of max) get weight 0.05 —
-    they still influence the model slightly but don't dominate.
-    Points with real traffic get weight 1.0.
-
-    This handles the "traffic on / traffic off" pattern without
-    harming sinusoidal or other continuous patterns: even the troughs
-    of a sine wave are typically well above 5% of the peak.
-    """
     threshold = biz.max() * 0.05
     return np.where(biz > threshold, 1.0, 0.05)
 
 
 def _fit_kwargs(model_type: str, weights: np.ndarray | None) -> dict:
-    """
-    Return the correct keyword arguments for model.fit() with sample weights.
-    All estimators use 'sample_weight' directly.
-    """
     if weights is None:
         return {}
     return {"sample_weight": weights}
@@ -448,14 +335,8 @@ def _train_with_cv(
     model_type: str,
     weights_tv: np.ndarray | None = None,
 ) -> object:
-    """Temporal CV on train+val, returns best fitted model.
-
-    weights_tv: sample weights aligned with X_tv/y_tv.
-                Passed to model.fit() so the algorithm focuses on
-                high-traffic points and down-weights idle periods.
-    """
     if model_type == "mean_baseline":
-        return None   # handled separately
+        return None
 
     grid = {
         "xgboost":    PARAM_GRID_XGB,
@@ -484,8 +365,6 @@ def _train_with_cv(
     return final
 
 
-# ── Per-target training pipeline ─────────────────────────────────────────────
-
 def _train_single_target(
     biz: np.ndarray,
     sys_arrays: dict[str, np.ndarray],
@@ -494,26 +373,11 @@ def _train_single_target(
     best_step_seconds: int = 60,
     base_step_seconds: int = 60,
 ) -> dict:
-    """
-    Train one model for one target metric.
-    Returns a dict with model, scaler, lag, r_star, model_type, metrics.
-
-    best_step_seconds: resolution chosen by step CV in correlation_analyzer.
-                       Data is resampled to this resolution before lag detection,
-                       matching the analysis performed during correlation analysis.
-    base_step_seconds: raw collection resolution (seconds).
-    """
-    # Resample to the step chosen by CV — same resolution used in correlation analysis
     factor = max(1, best_step_seconds // base_step_seconds)
     biz_rs = _resample(biz, factor)
     sys_rs = {k: _resample(v, factor) for k, v in sys_arrays.items()}
     n_rs   = len(biz_rs)
 
-    # Filter out simultaneous idle points — remove rows where both biz AND
-    # target sys metric are below 10% of their respective maximum.
-    # Using max-based threshold instead of percentile: with 80% idle data,
-    # the 10th percentile would be near zero and filter almost nothing.
-    # max-based threshold is robust regardless of idle/active ratio.
     biz_threshold = float(biz_rs.max()) * 0.10
     sys_threshold = float(sys_rs[target_key].max()) * 0.10
     active_mask = (biz_rs > biz_threshold) & (sys_rs[target_key] > sys_threshold)
@@ -527,7 +391,6 @@ def _train_single_target(
             target_key, idle_removed, n_rs, biz_threshold, sys_threshold,
         )
 
-    # Use active data for training; fall back to full if too few active points
     if n_active >= LOOKBACK + 20:
         biz_fit  = biz_active
         sys_fit  = sys_rs_active
@@ -538,10 +401,8 @@ def _train_single_target(
         sys_fit  = sys_rs
         n_fit    = n_rs
 
-    # Store max business metric seen in training data — used as biz_above_max feature
     max_biz_train = float(biz_fit.max())
 
-    # Split index for lag/corr detection (training data only — resampled)
     split     = int(TRAIN_RATIO * n_fit)
     biz_train = biz_fit[:split]
     sys_train = sys_fit[target_key][:split]
@@ -559,18 +420,15 @@ def _train_single_target(
         target_key, lag, r_star, rel_std, best_step_seconds, max_biz_train, model_type,
     )
 
-    # Build features on active (filtered) data, passing max_biz_train for biz_above_max
     X, y = _build_features_for_target(biz_fit, sys_fit, lag, target_key, n_fit,
                                        max_biz_train=max_biz_train,
                                        step_seconds=best_step_seconds)
 
-    # Temporal split: 80% train+val, 20% test
     n_rows = len(X)
     te     = max(1, int(TEST_SPLIT_RATIO * n_rows))
     X_tv, X_te = X[:-te], X[-te:]
     y_tv, y_te = y[:-te], y[-te:]
 
-    # Sample weights — align with feature rows (LOOKBACK rows dropped at start)
     biz_for_weights = biz_fit[LOOKBACK:n_fit - 1]
     all_weights     = _compute_sample_weights(biz_for_weights)
     w_tv = all_weights[:-te]
@@ -592,9 +450,6 @@ def _train_single_target(
         model_obj = _train_with_cv(X_tv_s, y_tv, model_type, weights_tv=w_tv)
         y_pred    = model_obj.predict(X_te_s)
 
-    # ── Extrapolation Ridge ──────────────────────────────────────────────────
-    # Fit a separate Ridge model on all training data for use when
-    # biz > max_biz_train. Ridge extrapolates naturally; GBR/XGBoost do not.
     biz_for_extrap = biz_fit[LOOKBACK:n_fit - 1][:-te]
     if model_type == "mean_baseline" or model_obj is None:
         extrap = {
@@ -607,7 +462,6 @@ def _train_single_target(
             X_tv_s, y_tv, biz_for_extrap, max_biz_train
         )
 
-    # Metrics
     r2  = float(r2_score(y_te, y_pred))
     mae = float(mean_absolute_error(y_te, y_pred))
     rmse= float(np.sqrt(mean_squared_error(y_te, y_pred)))
@@ -624,16 +478,9 @@ def _train_single_target(
         "model_type":    model_type,
         "mean_val":      float(y_tv.mean()),   # for mean_baseline fallback
         "max_biz_train": max_biz_train,        # for biz_above_max at inference
-        # Mean of each system metric over the active training window.
-        # Used in hypothetical inference mode to replace AR features
-        # so predictions aren't anchored to the current live state.
         "mean_sys_ctx": {
             k: float(arr.mean()) for k, arr in sys_fit.items()
         },
-        # Extrapolation models for biz > max_biz_train:
-        # - biz_only_ridge: trained on biz+time features only (no AR),
-        #   used in hypothetical inference to avoid AR confounding.
-        # - extrap_ridge: full-feature Ridge for live extrapolation.
         "biz_only_ridge":       extrap.get("biz_only_ridge"),
         "biz_only_scaler":      extrap.get("biz_only_scaler"),
         "extrap_ridge":         extrap.get("extrap_ridge"),
@@ -647,10 +494,7 @@ def _train_single_target(
     }
 
 
-# ── Evaluation helpers ────────────────────────────────────────────────────────
-
 def _compute_overall_metrics(per_target: dict[str, dict]) -> dict:
-    """Aggregate per-target metrics into a flat dict + mape_overall."""
     metrics: dict = {}
     mapes = []
     for key, info in per_target.items():
@@ -660,18 +504,12 @@ def _compute_overall_metrics(per_target: dict[str, dict]) -> dict:
     return metrics
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
-
 def train_model(
     db: Session,
     config: ForecastingConfig,
     bundle: MetricsBundle,
-    report: CorrelationReport,      # kept for API compatibility; lags re-derived per target
+    report: CorrelationReport,
 ) -> TrainedModel:
-    """
-    Train five independent models (one per system metric target) with
-    per-target lag detection on the training split and adaptive model selection.
-    """
     version  = _next_version(db, config.id)
     artifact = _artifact_path(config.id, version)
 
@@ -686,7 +524,6 @@ def train_model(
     db.refresh(record)
 
     try:
-        # Extract arrays from bundle
         biz = np.array([p["value"] for p in bundle.business], dtype=float)
         sys_arrays = {
             "cpu":     np.array([p["value"] for p in bundle.cpu],         dtype=float),
@@ -707,7 +544,6 @@ def train_model(
                 f"Not enough data: {n} points (need ≥ {LOOKBACK + 10})."
             )
 
-        # best_step_seconds from CV in correlation_analyzer — use same resolution
         best_step = getattr(report, "best_step_seconds", 60)
         base_step = getattr(report, "_base_step_seconds", 60)
 
@@ -716,7 +552,6 @@ def train_model(
             best_step,
         )
 
-        # Train one model per target
         per_target: dict[str, dict] = {}
         for key in TARGET_KEYS:
             per_target[key] = _train_single_target(
@@ -725,14 +560,11 @@ def train_model(
                 base_step_seconds=base_step,
             )
 
-        # Aggregate metrics
         metrics = _compute_overall_metrics(per_target)
 
-        # Reference distribution for drift detection
         from app.modules.drift_detector import compute_reference_distribution
         ref_dist = compute_reference_distribution(biz)
 
-        # Build params summary
         params = {
             "feature_set":        "advanced_per_target_v3",
             "lookback":           LOOKBACK,
@@ -750,12 +582,10 @@ def train_model(
             "input_distribution": ref_dist,
         }
 
-        # Determine dominant algorithm for display
         types = [info["model_type"] for info in per_target.values()]
         dominant = max(set(types), key=types.count)
         algo_name = dominant
 
-        # Persist artifact: dict of per-target dicts
         artifact_payload = {
             "per_target": per_target,
             "version":    "v3_per_target",
@@ -763,7 +593,6 @@ def train_model(
         joblib.dump(artifact_payload, artifact)
         logger.info("Artifact saved → %s", artifact)
 
-        # Update DB record
         record.algorithm     = algo_name
         record.parameters    = params
         record.metrics       = metrics

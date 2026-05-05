@@ -1,30 +1,3 @@
-"""
-Module 5 — Forecasting Engine  (v3: per-target adaptive inference)
-
-Artifact schema (v3):
-    {
-      "per_target": {
-          "cpu":     {"model": ..., "scaler": ..., "lag": int,
-                      "model_type": str, "mean_val": float, ...},
-          "ram_gb":  {...},
-          "ram_pct": {...},
-          "net":     {...},
-          "disk":    {...},
-      },
-      "version": "v3_per_target",
-    }
-
-At inference time:
-  - Fetches last AR_WINDOW points of system metrics and business metric
-    from Prometheus (same host:port as in ForecastingConfig).
-  - Builds the same advanced feature vector used during training,
-    using each target's individual lag.
-  - Runs each target's model independently.
-  - Falls back gracefully to mean_val if model is None (mean_baseline).
-
-Backward compat: if artifact has old schema (key "model" at top level),
-  falls back to legacy single-model inference.
-"""
 from __future__ import annotations
 
 import logging
@@ -43,25 +16,20 @@ from app.models.db_models import (
     ForecastResult,
     TrainedModel,
 )
-# Imported lazily inside functions to avoid circular import with model_trainer
-# (request_handler imports both modules at module level)
 
 logger = logging.getLogger(__name__)
 
-# Mirror constants from model_trainer — kept in sync manually
 LOOKBACK    = 30
 AR_WINDOW   = LOOKBACK + 5
 TARGET_KEYS = ["cpu", "ram_gb", "ram_pct", "net", "disk"]
 
 
 def _get_latest_ready_model(db, config_id):
-    """Lazy import wrapper to avoid circular dependency."""
     from app.modules.model_trainer import get_latest_ready_model
     return get_latest_ready_model(db, config_id)
 
 
 def _get_target_extra_features(target_key: str, hist: "np.ndarray") -> list:
-    """Lazy import wrapper to avoid circular dependency."""
     from app.modules.model_trainer import _target_extra_features
     return _target_extra_features(target_key, hist)
 
@@ -81,8 +49,6 @@ class InferencePrediction:
     disk:        TargetPrediction
 
 
-# ── Artifact loading ──────────────────────────────────────────────────────────
-
 def _load_artifact(model: TrainedModel) -> dict:
     if not model.artifact_path:
         raise ValueError(f"Model {model.id} has no artifact_path.")
@@ -92,8 +58,6 @@ def _load_artifact(model: TrainedModel) -> dict:
 def _is_v3(artifact: dict) -> bool:
     return artifact.get("version") == "v3_per_target"
 
-
-# ── Prometheus fetch helpers ──────────────────────────────────────────────────
 
 def _fetch_series(config: ForecastingConfig, query: str, n_points: int) -> np.ndarray:
     from app.modules.data_collector import _query_prometheus
@@ -146,8 +110,6 @@ def _fetch_biz_history(config: ForecastingConfig, current_value: float) -> np.nd
         return np.full(AR_WINDOW, current_value)
 
 
-# ── Single-target inference feature vector ────────────────────────────────────
-
 def _build_inference_row(
     biz_hist: np.ndarray,
     sys_ctx: dict[str, np.ndarray],
@@ -156,11 +118,6 @@ def _build_inference_row(
     at_time: datetime | None = None,
     max_biz_train: float | None = None,
 ) -> np.ndarray:
-    """Build exactly one feature row (same logic as _build_features_for_target).
-
-    max_biz_train: stored in the model artifact at training time.
-        Used to compute biz_above_max — the extrapolation signal.
-    """
     t   = at_time or datetime.utcnow()
     i   = len(biz_hist) - 1
     n   = len(biz_hist)
@@ -202,15 +159,12 @@ def _build_inference_row(
         s15 = arr[-15:].std()  + 1e-9 if len(arr) >= 15 else 1.0
         feats.extend([l1, l2, l3, m5, m15, m30, s5, s15])
 
-    # Use sys_ctx for the target's own history (ram_gb not in ctx → use ram_pct proxy)
     ctx_key = "ram_pct" if target_key == "ram_gb" else target_key
     hist = sys_ctx.get(ctx_key, np.zeros(AR_WINDOW))
     feats.extend(_get_target_extra_features(target_key, hist))
 
     return np.array([feats], dtype=float)
 
-
-# ── Core inference ────────────────────────────────────────────────────────────
 
 def _infer_one_target(
     info: dict,
@@ -220,12 +174,6 @@ def _infer_one_target(
     at_time: datetime | None = None,
     hypothetical: bool = False,
 ) -> float:
-    """Predict one target. Returns point estimate (float).
-
-    hypothetical=True: replace live AR context with training-time means.
-    Use this when the user asks 'what if RPS=X?' rather than
-    'what will happen in the next N minutes?'.
-    """
     if info["model_type"] == "mean_baseline" or info["model"] is None:
         return float(info["mean_val"])
 
@@ -235,7 +183,6 @@ def _infer_one_target(
     max_biz_train = info.get("max_biz_train")
 
     if hypothetical and "mean_sys_ctx" in info:
-        # Replace live AR features with training-time mean repeated AR_WINDOW times
         mean_ctx = info["mean_sys_ctx"]
         ctx = {k: np.full(AR_WINDOW, v) for k, v in mean_ctx.items()}
     else:
@@ -247,23 +194,17 @@ def _infer_one_target(
     X_sc = scaler.transform(X_row) if scaler is not None else X_row
     pred = float(model.predict(X_sc)[0])
 
-    # ── Extrapolation beyond training range ──────────────────────────────────
-    # All models (GBR, XGBoost, Ridge) can produce wrong extrapolation when
-    # hypothetical=True, because AR features are fixed at mean_sys_ctx which
-    # creates a confounded relationship with biz.
-    # Solution: use biz_only_ridge (trained without AR features) for
-    # hypothetical extrapolation — it has a clean biz→sys relationship.
     biz_current = biz_hist[-1]
     if max_biz_train is not None and biz_current > max_biz_train:
         boundary_pred = info.get("extrap_boundary_pred", pred)
 
         if hypothetical and info.get("biz_only_ridge") is not None:
-            from app.modules.model_trainer import N_BIZ_FEATURES
+            from app.modules.model_trainer import BIZ_ONLY_IDXS
             biz_only_ridge = info["biz_only_ridge"]
-            X_biz_s = X_sc[:, :N_BIZ_FEATURES]
+            X_biz_s = X_sc[:, BIZ_ONLY_IDXS]
             ridge_pred_raw = float(biz_only_ridge.predict(X_biz_s)[0])
             names = ["sin_h","cos_h","sin_d","cos_d","trend",
-                     "bl","bn","d1","d2","bz","bl*sh","bl*ch","above","rel"]
+                     "bl","bn","d1","d2","bz","above","rel"]
             feat_str = "  ".join(f"{n}={v:.2f}" for n,v in zip(names, X_biz_s[0]))
             logger.info("  biz feats scaled: %s", feat_str)
             logger.info("  coefs: %s", "  ".join(f"{n}={c:.2f}" for n,c in zip(names, biz_only_ridge.coef_)))
@@ -276,7 +217,6 @@ def _infer_one_target(
         else:
             ridge_pred = boundary_pred
 
-        # Blend: at boundary → boundary_pred, at 2×max → ridge_pred
         alpha = min(1.0, (biz_current - max_biz_train) / (max_biz_train + 1e-9))
         pred  = float(boundary_pred) * (1 - alpha) + float(ridge_pred) * alpha
         pred  = max(0.0, float(pred))
@@ -298,7 +238,6 @@ def _run_inference_v3(
     at_time: datetime | None = None,
     hypothetical: bool = False,
 ) -> InferencePrediction:
-    """Full v3 inference: five independent models."""
     pt = artifact["per_target"]
 
     cpu_pt = round(float(np.clip(_infer_one_target(pt["cpu"],     biz_hist, sys_ctx, "cpu",     at_time, hypothetical), 0, 100)), 2)
@@ -307,7 +246,6 @@ def _run_inference_v3(
     net_pt = round(max(0.0, _infer_one_target(pt["net"],     biz_hist, sys_ctx, "net",     at_time, hypothetical)), 2)
     dsk_pt = round(float(np.clip(_infer_one_target(pt["disk"],    biz_hist, sys_ctx, "disk",    at_time, hypothetical), 0, 100)), 2)
 
-    # No quantile intervals in v3 (can be added later per target)
     return InferencePrediction(
         cpu=         TargetPrediction(point=cpu_pt, lower=None, upper=None),
         ram_gb=      TargetPrediction(point=rgb_pt, lower=None, upper=None),
@@ -322,7 +260,6 @@ def _run_inference_legacy(
     business_value: float,
     at_time: datetime | None = None,
 ) -> InferencePrediction:
-    """Backward-compatible inference for old single-model artifacts."""
     t    = at_time or datetime.utcnow()
     hour = t.hour + t.minute / 60.0
     dow  = t.weekday()
@@ -343,21 +280,12 @@ def _run_inference_legacy(
     )
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
-
 def forecast(
     db: Session,
     config: ForecastingConfig,
     business_metric_value: float,
     hypothetical: bool = True,
 ) -> ForecastResult:
-    """Produce and persist a single-step forecast.
-
-    hypothetical=True (default): AR context is replaced with training-time
-    means so the prediction reflects 'what would happen at biz=X' rather
-    than 'what will happen in the next few minutes given the current state'.
-    Set hypothetical=False for short-horizon operational forecasts.
-    """
     model_rec = _get_latest_ready_model(db, config.id)
     if model_rec is None:
         raise ValueError(
@@ -374,9 +302,6 @@ def forecast(
 
     if _is_v3(artifact):
         if hypothetical:
-            # Fill entire history with current_value so derivative features
-            # (d1, d2, bz, bn) are neutral (0 or 1) — no fake spike artefacts
-            # from inserting a large biz value into a low-biz history.
             biz_hist = np.full(AR_WINDOW, business_metric_value)
         else:
             biz_hist = _fetch_biz_history(config, business_metric_value)

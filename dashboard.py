@@ -1,10 +1,3 @@
-"""
-Hardware Load Predictor — Streamlit Dashboard
-=============================================
-Run:  streamlit run dashboard.py
-Deps: pip install streamlit requests plotly pandas
-"""
-
 import time
 from datetime import datetime, timedelta
 from typing import Optional
@@ -15,24 +8,22 @@ import requests
 import streamlit as st
 from plotly.subplots import make_subplots
 
-# ── Page config ───────────────────────────────────────────────────────────────
 
 st.set_page_config(
     page_title="Прогнозирование нагрузки",
-    page_icon="⚡",
+    page_icon=None,
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── Colour palette ────────────────────────────────────────────────────────────
 
 COLOURS = {
-    "cpu":     "#ef4444",   # red
-    "ram_gb":  "#3b82f6",   # blue
-    "ram_pct": "#6366f1",   # indigo
-    "net":     "#10b981",   # emerald
-    "disk":    "#f59e0b",   # amber
-    "biz":     "#8b5cf6",   # violet
+    "cpu":     "#ef4444",
+    "ram_gb":  "#3b82f6",
+    "ram_pct": "#6366f1",
+    "net":     "#10b981",
+    "disk":    "#f59e0b",
+    "biz":     "#8b5cf6",
     "healthy": "#22c55e",
     "warning": "#f59e0b",
     "error":   "#ef4444",
@@ -46,15 +37,14 @@ METRIC_LABELS = {
     "predicted_disk_io_percent": "Disk IO %",
 }
 
-# ── Sidebar — connection ──────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.title("⚡ Прогнозирование нагрузки")
+    st.title("Прогнозирование нагрузки")
     st.markdown("---")
     api_url = st.text_input(
         "Predictor API URL",
         value="http://localhost:8000",
-        help="Base URL of the running hardware-load-predictor service",
+        help="Базовый URL запущенного сервиса прогнозирования",
     )
     prometheus_url = st.text_input(
         "Prometheus URL",
@@ -62,7 +52,7 @@ with st.sidebar:
         help="Used to display live metric graphs",
     )
     auto_refresh = st.toggle("Авто-обновление (30 с)", value=False)
-    if st.button("🔄 Обновить", use_container_width=True):
+    if st.button("Обновить", use_container_width=True):
         st.rerun()
     st.markdown("---")
     st.caption("Система прогнозирования нагрузки v2")
@@ -70,7 +60,6 @@ with st.sidebar:
 BASE = api_url.rstrip("/")
 PROM = prometheus_url.rstrip("/")
 
-# ── API helpers ───────────────────────────────────────────────────────────────
 
 def get(path: str, **params) -> Optional[dict | list]:
     try:
@@ -103,7 +92,7 @@ def delete(path: str) -> bool:
 
 
 def prom_query(expr: str, start_minutes: int = 60) -> pd.DataFrame:
-    """Query Prometheus range and return a tidy DataFrame."""
+    
     end   = datetime.utcnow()
     start = end - timedelta(minutes=start_minutes)
     try:
@@ -142,33 +131,26 @@ def api_reachable() -> bool:
         return False
 
 
-# ── Auto-refresh ──────────────────────────────────────────────────────────────
-
 if auto_refresh:
     time.sleep(0.1)
     st.rerun()
 
-# ── Connection check ──────────────────────────────────────────────────────────
 
 if not api_reachable():
-    st.error(f"⚠️  Cannot reach predictor at **{BASE}**. Is it running?")
+    st.error(f"Не удаётся подключиться к сервису по адресу {BASE}. Проверьте, запущен ли сервис.")
     st.code("docker compose up  # или  uvicorn app.main:app --port 8000")
     st.stop()
 
-# ── Tabs ──────────────────────────────────────────────────────────────────────
 
 tab_overview, tab_groups, tab_forecast, tab_metrics, tab_jobs, tab_accuracy = st.tabs([
-    "📊 Обзор",
-    "🖥️ Группы серверов",
-    "🔮 Прогноз",
-    "📈 Живые метрики",
-    "⚙️ Задания обучения",
-    "🎯 Точность",
+    "Обзор",
+    "Группы серверов",
+    "Прогноз",
+    "Живые метрики",
+    "Задания обучения",
+    "Точность",
 ])
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — OVERVIEW
-# ══════════════════════════════════════════════════════════════════════════════
 
 with tab_overview:
     st.header("Обзор системы")
@@ -216,7 +198,7 @@ with tab_overview:
                             {
                                 "Name":    s["name"],
                                 "Host":    f"{s['host']}:{s['port']}",
-                                "Active":  "✅" if s["is_active"] else "❌",
+                                "Активен": "Да" if s["is_active"] else "Нет",
                                 "Tags":    ", ".join(f"{k}={v}" for k, v in (s.get("tags") or {}).items()),
                             }
                             for s in servers
@@ -226,15 +208,10 @@ with tab_overview:
                         st.info("Серверы не добавлены.")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — SERVER GROUPS
-# ══════════════════════════════════════════════════════════════════════════════
-
 with tab_groups:
     st.header("Групп серверов")
 
-    # ── Create group ──────────────────────────────────────────────────────────
-    with st.expander("➕ Создать группу", expanded=False):
+    with st.expander("Создать группу", expanded=False):
         with st.form("create_group"):
             g_name   = st.text_input("Название группы", placeholder="cinema-backend")
             g_desc   = st.text_input("Описание (необязательно)")
@@ -271,7 +248,6 @@ with tab_groups:
         )
         g = selected_group
 
-        # ── Manage group ──────────────────────────────────────────────────────
         st.subheader(f"Group: {g['name']}")
 
         col_left, col_right = st.columns(2)
@@ -281,12 +257,11 @@ with tab_groups:
             servers = g.get("servers", [])
             if servers:
                 for s in servers:
-                    badge = "🟢" if s["is_active"] else "🔴"
+                    badge = "[активен]" if s["is_active"] else "[неактивен]"
                     st.markdown(f"{badge} **{s['name']}** — `{s['host']}:{s['port']}`")
             else:
                 st.caption("Серверов нет.")
 
-            # Add server
             with st.form(f"add_server_{g['id']}"):
                 st.markdown("**Add server**")
                 s_name = st.text_input("Имя сервера", placeholder="gateway")
@@ -310,16 +285,16 @@ with tab_groups:
         with col_right:
             st.markdown("**Действия**")
 
-            if st.button("🔧 Создать конфиги", key=f"prov_{g['id']}", use_container_width=True,
+            if st.button("Создать конфиги", key=f"prov_{g['id']}", use_container_width=True,
                          help="Создать ForecastingConfig для каждого активного сервера"):
                 result = post(f"/groups/{g['id']}/provision", {})
                 if result:
                     n = result.get("configs_created", 0)
-                    st.success(f"Provisioned **{n}** config(s)." if n else "Все серверы уже сконфигурированы.")
+                    st.success(f"Создано конфигураций: {n}." if n else "Все серверы уже сконфигурированы.")
 
             lookback = st.number_input("Дней истории для обучения", value=7, min_value=1, max_value=365,
                                        key=f"lb_{g['id']}")
-            if st.button("🚀 Обучить все серверы", key=f"train_{g['id']}", use_container_width=True,
+            if st.button("Обучить все серверы", key=f"train_{g['id']}", use_container_width=True,
                          type="primary"):
                 result = post(f"/groups/{g['id']}/train/", {"lookback_days": int(lookback)})
                 if result:
@@ -328,15 +303,11 @@ with tab_groups:
                         st.caption(f"Job {job['job_id']} — {job['message']}")
 
             st.markdown("---")
-            if st.button("🗑️ Удалить группу", key=f"del_{g['id']}", use_container_width=True):
+            if st.button("Удалить группу", key=f"del_{g['id']}", use_container_width=True):
                 if delete(f"/groups/{g['id']}"):
                     st.success("Удалено.")
                     st.rerun()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — FORECAST
-# ══════════════════════════════════════════════════════════════════════════════
 
 with tab_forecast:
     st.header("Прогноз нагрузки кластера")
@@ -356,7 +327,7 @@ with tab_forecast:
             )
         with col_inp:
             biz_val = st.number_input(
-                f"Expected {fc_group['business_metric_name']}",
+                "Значение бизнес-метрики",
                 min_value=0.01, value=10.0, step=0.5,
                 key="fc_biz_val",
             )
@@ -369,76 +340,102 @@ with tab_forecast:
             if result:
                 st.markdown("---")
 
-                # ── Cluster aggregates ──────────────────────────────────────
                 st.subheader("Агрегаты кластера")
                 ca, cb, cc, cd, ce = st.columns(5)
-                ca.metric("CPU (ср.)",      f"{result['cluster_cpu_avg_percent']:.1f}%",
-                          delta_color="inverse")
-                cb.metric("RAM (сумма)",    f"{result['cluster_ram_total_gb']:.1f} GB")
-                cc.metric("RAM (ср.)",      f"{result['cluster_ram_avg_percent']:.1f}%",
-                          delta_color="inverse")
-                cd.metric("Сеть (сумма)",    f"{result['cluster_network_total_mbps']:.1f} Mbps")
-                ce.metric("Disk IO (ср.)",  f"{result['cluster_disk_avg_io_percent']:.1f}%",
-                          delta_color="inverse")
+                ca.metric("CPU (среднее)",    f"{result['cluster_cpu_avg_percent']:.1f}%")
+                cb.metric("RAM (сумма)",       f"{result['cluster_ram_total_gb']:.2f} ГБ")
+                cc.metric("RAM (среднее)",     f"{result['cluster_ram_avg_percent']:.1f}%")
+                cd.metric("Сеть (сумма)",      f"{result['cluster_network_total_mbps']:.1f} Мбит/с")
+                ce.metric("Диск IO (среднее)", f"{result['cluster_disk_avg_io_percent']:.1f}%")
 
-                # ── Per-server breakdown ────────────────────────────────────
                 if result["servers"]:
                     st.subheader("Прогноз по серверам")
-
-                    # Gauge chart per server
                     servers_data = result["servers"]
-                    n = len(servers_data)
-                    cols = st.columns(n)
+                    n_srv = len(servers_data)
+                    cols = st.columns(n_srv)
 
                     for i, srv in enumerate(servers_data):
                         with cols[i]:
-                            st.markdown(f"**{srv['server_name']}**")
+                            st.markdown(f"#### {srv['server_name']}")
                             st.caption(srv["host"])
 
-                            fig = go.Figure()
-                            metrics = [
-                                ("CPU",        srv["predicted_cpu_percent"],     100, COLOURS["cpu"]),
-                                ("RAM %",      srv["predicted_ram_percent"],      100, COLOURS["ram_pct"]),
-                                ("Disk IO",    srv["predicted_disk_io_percent"],  100, COLOURS["disk"]),
-                            ]
-                            for label, val, max_val, colour in metrics:
-                                fig.add_trace(go.Indicator(
-                                    mode="gauge+number",
-                                    value=val,
-                                    title={"text": label, "font": {"size": 12}},
-                                    gauge={
-                                        "axis":  {"range": [0, max_val], "tickfont": {"size": 9}},
-                                        "bar":   {"color": colour},
-                                        "steps": [
-                                            {"range": [0, 60],      "color": "#f0fdf4"},
-                                            {"range": [60, 80],     "color": "#fef9c3"},
-                                            {"range": [80, max_val],"color": "#fef2f2"},
-                                        ],
-                                        "threshold": {"line": {"color": "red", "width": 2},
-                                                      "thickness": 0.75, "value": 85},
-                                    },
-                                    domain={"row": metrics.index((label, val, max_val, colour)),
-                                            "column": 0},
-                                ))
+                            cpu  = srv["predicted_cpu_percent"]
+                            ramp = srv["predicted_ram_percent"]
+                            ramg = srv["predicted_ram_gb"]
+                            net  = srv["predicted_network_mbps"]
+                            disk = srv["predicted_disk_io_percent"]
 
-                            fig.update_layout(
-                                grid={"rows": 3, "columns": 1, "pattern": "independent"},
-                                height=420,
-                                margin={"t": 20, "b": 10, "l": 10, "r": 10},
+                            def colour(v):
+                                if v >= 85: return "#dc2626"
+                                if v >= 60: return "#d97706"
+                                return "#16a34a"
+
+                            def bar(v, mx=100):
+                                pct = min(100, v / mx * 100)
+                                return (
+                                    f'<div style="background:#e5e7eb;border-radius:4px;'
+                                    f'height:10px;margin:2px 0 8px 0">'
+                                    f'<div style="width:{pct:.1f}%;background:{colour(v)};'
+                                    f'border-radius:4px;height:10px"></div></div>'
+                                )
+
+                            st.markdown(
+                                f'**Загрузка CPU:**&nbsp; '
+                                f'<span style="color:{colour(cpu)};font-size:1.4em;font-weight:700">'
+                                f'{cpu:.1f}%</span>',
+                                unsafe_allow_html=True,
                             )
-                            st.plotly_chart(fig, use_container_width=True)
+                            st.markdown(bar(cpu), unsafe_allow_html=True)
 
-                            # Absolute values below
-                            st.metric("RAM", f"{srv['predicted_ram_gb']:.2f} GB")
-                            st.metric("Сеть", f"{srv['predicted_network_mbps']:.1f} Mbps")
+                            st.markdown(
+                                f'**Оперативная память:**&nbsp; '
+                                f'<span style="color:{colour(ramp)};font-size:1.4em;font-weight:700">'
+                                f'{ramp:.1f}%</span>&nbsp; ({ramg:.2f} ГБ)',
+                                unsafe_allow_html=True,
+                            )
+                            st.markdown(bar(ramp), unsafe_allow_html=True)
+
+                            st.markdown(
+                                f'**Сетевой трафик:**&nbsp; '
+                                f'<span style="color:#1d4ed8;font-size:1.4em;font-weight:700">'
+                                f'{net:.1f} Мбит/с</span>',
+                                unsafe_allow_html=True,
+                            )
+
+                            st.markdown(
+                                f'**Диск IO:**&nbsp; '
+                                f'<span style="color:{colour(disk)};font-size:1.4em;font-weight:700">'
+                                f'{disk:.1f}%</span>',
+                                unsafe_allow_html=True,
+                            )
+                            st.markdown(bar(disk), unsafe_allow_html=True)
+
+                            cfg_models = get(f"/configs/{srv['config_id']}/models/") or []
+                            if cfg_models:
+                                m = cfg_models[0]
+                                pt = m.get("parameters", {}).get("per_target", {})
+                                mtr = m.get("metrics", {})
+                                st.markdown("---")
+                                st.caption("Качество моделей (тестовая выборка)")
+                                rows = []
+                                for key, lbl in [("cpu","CPU"),("ram_gb","RAM ГБ"),
+                                                  ("ram_pct","RAM %"),("net","Сеть"),("disk","Диск")]:
+                                    info = pt.get(key, {})
+                                    r2   = mtr.get(f"r2_{key}")
+                                    mae  = mtr.get(f"mae_{key}")
+                                    mape = mtr.get(f"mape_{key}")
+                                    rows.append({
+                                        "Показатель": lbl,
+                                        "Алгоритм":   info.get("model_type", "—"),
+                                        "R²":         f"{r2:.3f}"    if r2   is not None else "—",
+                                        "MAE":        f"{mae:.2f}"   if mae  is not None else "—",
+                                        "MAPE":       f"{mape:.1f}%" if mape is not None else "—",
+                                    })
+                                st.dataframe(rows, use_container_width=True, hide_index=True)
 
                 if result.get("skipped_servers"):
-                    st.warning(f"Skipped (no trained model): {', '.join(result['skipped_servers'])}")
+                    st.warning(f"Серверы без обученной модели (пропущены): {', '.join(result['skipped_servers'])}")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — LIVE METRICS
-# ══════════════════════════════════════════════════════════════════════════════
 
 with tab_metrics:
     st.header("Живые метрики из Prometheus")
@@ -459,7 +456,6 @@ with tab_metrics:
 
     inst_selector = f'{{instance="{instance_filter}"}}' if instance_filter else ""
 
-    # ── Business metric ───────────────────────────────────────────────────────
     st.subheader("Бизнес-метрика — Запросы / мин")
 
     groups = get("/groups/") or []
@@ -501,7 +497,6 @@ with tab_metrics:
 
     st.markdown("---")
 
-    # ── System metrics ────────────────────────────────────────────────────────
     st.subheader("Системные метрики")
 
     system_queries = [
@@ -536,7 +531,6 @@ with tab_metrics:
          COLOURS["disk"], "%", [0, 100]),
     ]
 
-    # Two-column grid for system charts
     for row_start in range(0, len(system_queries), 2):
         pair = system_queries[row_start:row_start + 2]
         cols = st.columns(len(pair))
@@ -573,10 +567,6 @@ with tab_metrics:
                 st.plotly_chart(fig, use_container_width=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 5 — TRAINING JOBS
-# ══════════════════════════════════════════════════════════════════════════════
-
 with tab_jobs:
     st.header("Задания обучения")
 
@@ -597,7 +587,7 @@ with tab_jobs:
         with col_train:
             st.subheader("Запустить обучение")
             lookback = st.slider("Дней истории", 1, 90, 7, key="jobs_lookback")
-            if st.button("🚀 Обучить", type="primary", key="jobs_train_btn"):
+            if st.button("Обучить", type="primary", key="jobs_train_btn"):
                 result = post(f"/configs/{cfg_id}/train/", {"lookback_days": lookback})
                 if result:
                     st.success(f"Job submitted — id={result['job_id']}  status={result['status']}")
@@ -606,9 +596,9 @@ with tab_jobs:
             st.subheader("История заданий")
             jobs = get(f"/configs/{cfg_id}/train/jobs") or []
             if jobs:
-                STATUS_ICON = {"queued": "🕐", "running": "🔄", "done": "✅", "failed": "❌"}
+                STATUS_ICON = {"queued": "в очереди", "running": "выполняется", "done": "завершено", "failed": "ошибка"}
                 for job in jobs[:10]:
-                    icon = STATUS_ICON.get(job["status"], "❓")
+                    icon = STATUS_ICON.get(job["status"], "—")
                     dur  = f"  ({job['duration_seconds']:.0f}s)" if job.get("duration_seconds") else ""
                     st.markdown(f"{icon} Job **{job['id']}** — `{job['status']}`{dur}")
                     if job.get("error_message"):
@@ -622,8 +612,8 @@ with tab_jobs:
             models = get(f"/configs/{cfg_id}/train/models") or []
             if models:
                 for model in models[:5]:
-                    status_colour = {"ready": "🟢", "training": "🟡",
-                                     "failed": "🔴", "pending": "⚪"}.get(model["status"], "⚪")
+                    status_colour = {"ready": "готова", "training": "обучается",
+                                     "failed": "ошибка", "pending": "ожидание"}.get(model["status"], "—")
                     st.markdown(
                         f"{status_colour} **v{model['version']}** — "
                         f"`{model['algorithm']}`  "
@@ -653,7 +643,7 @@ with tab_jobs:
                             rmse = m.get(f"rmse_{t_key}")
                             mape = m.get(f"mape_{t_key}")
                             mtype= pt.get(t_key, {}).get("model_type", "?")
-                            r2_icon = "🟢" if r2 and r2 > 0.7 else ("🟡" if r2 and r2 > 0.4 else "🔴")
+                            r2_icon = ""
                             row = st.columns([2,1,1,1,1,1])
                             row[0].markdown(f"<span style='color:{t_color}'>■</span> **{t_label}**", unsafe_allow_html=True)
                             row[1].caption(mtype or "?")
@@ -666,10 +656,6 @@ with tab_jobs:
             else:
                 st.caption("Моделей нет.")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 6 — ACCURACY
-# ══════════════════════════════════════════════════════════════════════════════
 
 with tab_accuracy:
     st.header("Точность модели и дрейф данных")
@@ -686,7 +672,6 @@ with tab_accuracy:
         )
         cfg_id = acc_cfg["id"]
 
-        # Get latest ready model for this config
         models = get(f"/configs/{cfg_id}/train/models") or []
         ready  = [m for m in models if m["status"] == "ready"]
 
@@ -700,7 +685,7 @@ with tab_accuracy:
             with col_status:
                 status = get(f"/models/{model_id}/accuracy")
                 if status:
-                    health_icon = "✅ Healthy" if status["is_healthy"] else "⚠️ Unhealthy"
+                    health_icon = "Норма" if status["is_healthy"] else "Проблема"
                     health_colour = COLOURS["healthy"] if status["is_healthy"] else COLOURS["warning"]
                     st.markdown(
                         f"<h3 style='color:{health_colour}'>{health_icon}</h3>",
@@ -743,7 +728,7 @@ with tab_accuracy:
                             unsafe_allow_html=True,
                         )
                         if ev.get("triggered_retrain"):
-                            st.warning("⚡ This evaluation triggered an automatic retraining.")
+                            st.warning("Данная оценка инициировала автоматическое retraining.")
 
             with col_eval:
                 st.markdown("**Действия**")
@@ -756,7 +741,6 @@ with tab_accuracy:
                     else:
                         st.error("Ошибка оценки — нужно больше прогнозов с фактическими значениями.")
 
-            # ── History chart ─────────────────────────────────────────────────
             st.markdown("---")
             st.subheader("История R²")
             history = get(f"/models/{model_id}/accuracy/history") or []
@@ -793,7 +777,6 @@ with tab_accuracy:
                 )
                 st.plotly_chart(fig_r2, use_container_width=True)
 
-                # PSI history
                 if "psi_value" in df_hist.columns:
                     st.subheader("История дрейфа (PSI)")
                     fig_psi = go.Figure()

@@ -1,8 +1,3 @@
-"""
-Module 1 — Configuration Management
-Handles CRUD for ForecastingConfig records (engineer-defined bindings
-between a business metric and a monitored host).
-"""
 from sqlalchemy.orm import Session
 from fastapi import HTTPException, status
 

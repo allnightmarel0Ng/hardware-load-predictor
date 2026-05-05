@@ -1,24 +1,3 @@
-"""
-Module 6 — Accuracy Monitor
-Evaluates post-deployment model accuracy by comparing stored forecasts
-against actual system metric values fetched from Prometheus.
-
-How it works:
-  1. The scheduler wakes up every RETRAIN_INTERVAL_HOURS.
-  2. For each READY model it finds all ForecastResult rows that:
-       a. were created more than LAG_FETCH_BUFFER_MINUTES ago
-          (so the actual values have had time to materialise in Prometheus)
-       b. have not yet had their actuals fetched (actuals_fetched_at IS NULL)
-  3. It queries Prometheus for the actual cpu/ram/net values at each
-     forecast timestamp using an instant-query at (created_at + lag_minutes).
-  4. It writes the actuals back into ForecastResult and computes MAE,
-     RMSE, MAPE, R² across all evaluated pairs for that model, storing
-     the result in ModelEvaluation.
-  5. If avg R² < accuracy_threshold it triggers retraining.
-
-The Prometheus fetch is isolated in _fetch_actuals_from_prometheus() so it
-can be monkeypatched in tests without network access.
-"""
 from __future__ import annotations
 
 import logging
@@ -45,16 +24,10 @@ logger = logging.getLogger(__name__)
 
 _scheduler: BackgroundScheduler | None = None
 
-# After a forecast is issued, wait at least this many minutes before
-# trying to fetch actuals from Prometheus (so data has propagated).
 LAG_FETCH_BUFFER_MINUTES: int = 10
 
-# Minimum number of forecast-actual pairs required before we compute
-# evaluation metrics. Below this we skip to avoid noisy estimates.
 MIN_EVAL_SAMPLES: int = 5
 
-
-# ── Prometheus queries ────────────────────────────────────────────────────────
 
 class ActualValues(NamedTuple):
     cpu_percent:      float
@@ -69,13 +42,6 @@ def _fetch_actuals_from_prometheus(
     port: int,
     at_time: datetime,
 ) -> ActualValues | None:
-    """
-    Fetch actual system metric values from Prometheus at a specific timestamp
-    using the instant-query API (GET /api/v1/query?query=<expr>&time=<ts>).
-
-    Fetches five targets: CPU %, RAM GB, RAM %, Network Mbps, Disk IO %.
-    Returns None if Prometheus is unreachable or any metric returns no data.
-    """
     ts       = at_time.timestamp()
     base_url = f"http://{host}:{port}/api/v1/query"
 
@@ -115,17 +81,7 @@ def _fetch_actuals_from_prometheus(
     )
 
 
-# ── Actuals back-fill ─────────────────────────────────────────────────────────
-
 def _backfill_actuals(db: Session, model: TrainedModel) -> list[ForecastResult]:
-    """
-    For all ForecastResult rows tied to this model that:
-      - were issued more than LAG_FETCH_BUFFER_MINUTES ago
-      - have not yet had actuals fetched
-    fetch the actual metric values from Prometheus and write them back.
-
-    Returns the updated rows that now have all three actuals populated.
-    """
     cutoff = datetime.utcnow() - timedelta(minutes=LAG_FETCH_BUFFER_MINUTES)
 
     pending = (
@@ -153,12 +109,10 @@ def _backfill_actuals(db: Session, model: TrainedModel) -> list[ForecastResult]:
     filled: list[ForecastResult] = []
 
     for fr in pending:
-        # The actual values materialise at created_at + lag (the forecast horizon)
         actual_ts = fr.created_at + timedelta(minutes=lag)
         actuals = _fetch_actuals_from_prometheus(config.host, config.port, actual_ts)
 
         if actuals is None:
-            # Prometheus unavailable or no data — skip this row, try again later
             continue
 
         fr.actual_cpu_percent     = actuals.cpu_percent
@@ -176,8 +130,6 @@ def _backfill_actuals(db: Session, model: TrainedModel) -> list[ForecastResult]:
     return filled
 
 
-# ── Metric computation ────────────────────────────────────────────────────────
-
 def _mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     mask = y_true != 0
     if not mask.any():
@@ -186,10 +138,6 @@ def _mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 
 def _compute_post_deployment_metrics(rows: list[ForecastResult]) -> dict:
-    """
-    Compute MAE, RMSE, MAPE, R² from a list of ForecastResult rows
-    that have all five predicted and actual values populated.
-    """
     cpu_pred = np.array([r.predicted_cpu_percent     for r in rows])
     rgb_pred = np.array([r.predicted_ram_gb           for r in rows])
     rpt_pred = np.array([r.predicted_ram_percent      for r in rows])
@@ -248,19 +196,11 @@ def _needs_retraining(metrics: dict, threshold: float) -> bool:
     return needs
 
 
-# ── Per-model evaluation ──────────────────────────────────────────────────────
-
 def _evaluate_model(db: Session, model: TrainedModel) -> ModelEvaluation | None:
-    """
-    Back-fill actuals, compute post-deployment metrics + PSI drift check,
-    persist a ModelEvaluation row, and return it (or None if insufficient data).
-    """
     from app.modules.drift_detector import check_drift_from_snapshot
 
-    # Step 1: try to fill in any pending actuals
     _backfill_actuals(db, model)
 
-    # Step 2: collect all rows that now have actuals
     evaluated_rows = (
         db.query(ForecastResult)
         .filter(
@@ -277,10 +217,8 @@ def _evaluate_model(db: Session, model: TrainedModel) -> ModelEvaluation | None:
         )
         return None
 
-    # Step 3: compute output accuracy metrics (MAE, RMSE, MAPE, R²)
     metrics = _compute_post_deployment_metrics(evaluated_rows)
 
-    # Step 4: check input distribution drift (PSI)
     drift_triggered = False
     psi_value       = None
     psi_level       = "stable"
@@ -309,11 +247,9 @@ def _evaluate_model(db: Session, model: TrainedModel) -> ModelEvaluation | None:
             "Model %d has no stored input_distribution — skipping PSI check.", model.id
         )
 
-    # Step 5: decide on retraining from R² or drift
     r2_triggered = _needs_retraining(metrics, settings.accuracy_threshold)
     retrain      = r2_triggered or drift_triggered
 
-    # Step 6: persist evaluation record
     evaluation = ModelEvaluation(
         model_id=model.id,
         config_id=model.config_id,
@@ -343,10 +279,7 @@ def _evaluate_model(db: Session, model: TrainedModel) -> ModelEvaluation | None:
     return evaluation
 
 
-# ── Retrain trigger ───────────────────────────────────────────────────────────
-
 def _trigger_retrain(db: Session, config_id: int) -> None:
-    """Initiate background retraining. Imports are deferred to avoid circular deps."""
     from app.modules.data_collector import fetch_historical_data
     from app.modules.correlation_analyzer import analyze
     from app.modules.model_trainer import train_model
@@ -374,14 +307,7 @@ def _trigger_retrain(db: Session, config_id: int) -> None:
         logger.exception("Retraining failed for config_id=%d", config_id)
 
 
-# ── Scheduler job ─────────────────────────────────────────────────────────────
-
 def _evaluate_all_models() -> None:
-    """
-    Main job run by the scheduler. Evaluates every READY model.
-    Creates a fresh DB session per run so the job is independent
-    of any HTTP request lifecycle.
-    """
     db: Session = SessionLocal()
     try:
         models = db.query(TrainedModel).filter_by(status=ModelStatus.READY).all()
@@ -395,13 +321,7 @@ def _evaluate_all_models() -> None:
         db.close()
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
-
 def get_accuracy_status(db: Session, model_id: int) -> dict:
-    """
-    Return the latest ModelEvaluation for a given model plus health status.
-    Called by the request handler to serve GET /models/{id}/accuracy.
-    """
     model = db.get(TrainedModel, model_id)
     if not model:
         return {}
@@ -448,17 +368,11 @@ def get_accuracy_status(db: Session, model_id: int) -> dict:
 
 
 def force_evaluate(db: Session, model_id: int) -> ModelEvaluation | None:
-    """
-    Trigger an immediate evaluation for a specific model.
-    Called by POST /models/{id}/accuracy/evaluate.
-    """
     model = db.get(TrainedModel, model_id)
     if not model or model.status != ModelStatus.READY:
         return None
     return _evaluate_model(db, model)
 
-
-# ── Scheduler lifecycle ───────────────────────────────────────────────────────
 
 def start_scheduler() -> None:
     global _scheduler

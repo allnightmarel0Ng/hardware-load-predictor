@@ -1,12 +1,3 @@
-"""
-Tests for Module 2 — Data Collector.
-
-Strategy:
-  - _query_prometheus()      is the real HTTP function — tested via monkeypatch
-  - _query_prometheus_stub() is synthetic — tested directly (no network)
-  - fetch_historical_data()  routes to real or stub — tested both paths
-  - _align_series()          pure logic — tested directly
-"""
 from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
 
@@ -23,10 +14,8 @@ from app.modules.data_collector import (
 )
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
-
 def _make_prom_response(n: int = 10, base: float = 50.0) -> dict:
-    """Build a minimal Prometheus range-query success response."""
+    
     now = datetime.utcnow()
     values = [
         [str((now + timedelta(minutes=i)).timestamp()), str(base + i * 0.5)]
@@ -38,17 +27,13 @@ def _make_prom_response(n: int = 10, base: float = 50.0) -> dict:
     }
 
 def _make_series(n: int, base: float = 50.0) -> list[dict]:
-    """Build a simple timeseries list."""
+    
     now = datetime.utcnow()
     return [
         {"timestamp": now + timedelta(minutes=i), "value": base + float(i)}
         for i in range(n)
     ]
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# _query_prometheus_stub — synthetic path (no network)
-# ══════════════════════════════════════════════════════════════════════════════
 
 class TestQueryPrometheusStub:
     def test_returns_non_empty_list(self):
@@ -91,13 +76,9 @@ class TestQueryPrometheusStub:
         assert len(r24) > len(r1)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# _query_prometheus — real HTTP path (monkeypatched)
-# ══════════════════════════════════════════════════════════════════════════════
-
 class TestQueryPrometheusReal:
     def _mock_get(self, response_body: dict):
-        """Return a context-manager mock for httpx.Client.get()."""
+        
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
         mock_resp.json.return_value = response_body
@@ -136,7 +117,7 @@ class TestQueryPrometheusReal:
         assert result == []
 
     def test_averages_multiple_series(self):
-        """If Prometheus returns N series, values should be averaged."""
+        
         end   = datetime.utcnow()
         start = end - timedelta(hours=1)
         ts    = str(end.timestamp())
@@ -166,10 +147,6 @@ class TestQueryPrometheusReal:
                 _query_prometheus("h", 9090, "metric", start, end)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# _generate_system_stub
-# ══════════════════════════════════════════════════════════════════════════════
-
 class TestGenerateSystemStub:
     def test_output_length_matches_input(self):
         business = _make_series(100)
@@ -188,15 +165,10 @@ class TestGenerateSystemStub:
         assert sum(high) > sum(low)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# _align_series
-# ══════════════════════════════════════════════════════════════════════════════
-
 class TestAlignSeries:
     def test_identical_timestamps_unchanged(self):
         s1 = _make_series(10, 10.0)
         s2 = _make_series(10, 20.0)
-        # Give them exactly the same timestamps
         for i in range(10):
             s2[i]["timestamp"] = s1[i]["timestamp"]
         a1, a2 = _align_series(s1, s2)
@@ -230,15 +202,8 @@ class TestAlignSeries:
         assert timestamps == sorted(timestamps)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# fetch_historical_data — stub mode (default in tests)
-# ══════════════════════════════════════════════════════════════════════════════
-
 class TestFetchHistoricalDataStub:
-    """
-    In tests settings.use_prometheus_stub is True (set in conftest.py)
-    so no real HTTP calls are made.
-    """
+    
 
     def test_returns_metrics_bundle(self):
         bundle = fetch_historical_data("h", 9090, "metric", lookback_days=1)
@@ -263,12 +228,8 @@ class TestFetchHistoricalDataStub:
         assert len(b7.business) > len(b1.business)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# fetch_historical_data — real path (monkeypatched)
-# ══════════════════════════════════════════════════════════════════════════════
-
 class TestFetchHistoricalDataReal:
-    """Test the real Prometheus path by patching _query_prometheus."""
+    
 
     def _fake_query(self, host, port, formula, start, end, step_seconds=60):
         return _query_prometheus_stub(host, port, formula, start, end, step_seconds)
@@ -296,7 +257,7 @@ class TestFetchHistoricalDataReal:
         assert "net_q" in call_count
 
     def test_alignment_applied_in_real_mode(self):
-        """Real mode should call _align_series to harmonise timestamps."""
+        
         with patch("app.modules.data_collector.settings") as mock_settings:
             mock_settings.use_prometheus_stub = False
             mock_settings.prometheus_cpu_query = "cpu_q"

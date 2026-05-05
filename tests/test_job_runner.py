@@ -1,9 +1,3 @@
-"""
-Tests for job_runner.py — async training job submission and lifecycle.
-
-Strategy: patch _run_training_job to avoid actually running training in
-thread-pool threads during tests, then test the job lifecycle state machine.
-"""
 import time
 import threading
 from datetime import datetime
@@ -17,8 +11,6 @@ from app.modules.config_manager import create_config
 from app.schemas.schemas import ForecastingConfigCreate
 
 
-# ── fixtures ──────────────────────────────────────────────────────────────────
-
 def _cfg(name: str) -> ForecastingConfigCreate:
     return ForecastingConfigCreate(
         name=name, host="prometheus.internal", port=9090,
@@ -26,8 +18,6 @@ def _cfg(name: str) -> ForecastingConfigCreate:
         business_metric_formula="sum(rate(orders_total[1m]))",
     )
 
-
-# ── submit_training_job ───────────────────────────────────────────────────────
 
 class TestSubmitTrainingJob:
     def test_creates_queued_job_record(self, db):
@@ -73,8 +63,6 @@ class TestSubmitTrainingJob:
                 ids.append(j.id)
         assert len(set(ids)) == 3
 
-
-# ── get_job / list_jobs ───────────────────────────────────────────────────────
 
 class TestGetAndListJobs:
     def test_get_job_returns_correct_record(self, db):
@@ -127,13 +115,8 @@ class TestGetAndListJobs:
         assert listed_ids == sorted(created_ids, reverse=True)
 
 
-# ── _run_training_job state machine ──────────────────────────────────────────
-
 class TestRunTrainingJobStateMachine:
-    """
-    Test the worker function's state transitions without actually training.
-    We directly call _run_training_job with mocked pipeline functions.
-    """
+    
 
     def _create_queued_job(self, db, name: str) -> tuple:
         cfg = create_config(db, _cfg(name))
@@ -143,7 +126,16 @@ class TestRunTrainingJobStateMachine:
             status=JobStatus.QUEUED,
         )
         db.add(job); db.commit(); db.refresh(job)
+        db.close()
         return cfg, job
+
+    def _reload_job(self, job_id: int):
+        from app.core.database import SessionLocal
+        s = SessionLocal()
+        try:
+            return s.get(TrainingJob, job_id)
+        finally:
+            s.close()
 
     def test_successful_run_sets_done_status(self, db):
         from app.modules.data_collector import MetricsBundle
@@ -158,14 +150,14 @@ class TestRunTrainingJobStateMachine:
         fake_bundle = MagicMock(spec=MetricsBundle)
         fake_report = MagicMock(spec=CorrelationReport)
         fake_report.any_significant = True
+        fake_report.is_business_constant = False
 
-        with patch("app.modules.job_runner.fetch_historical_data", return_value=fake_bundle), \
-             patch("app.modules.job_runner.analyze",               return_value=fake_report), \
-             patch("app.modules.job_runner.train_model",           return_value=fake_model):
+        with patch("app.modules.data_collector.fetch_historical_data", return_value=fake_bundle), \
+             patch("app.modules.correlation_analyzer.analyze",    return_value=fake_report), \
+             patch("app.modules.model_trainer.train_model",       return_value=fake_model):
             job_runner._run_training_job(job.id)
 
-        db.expire_all()
-        updated = db.get(TrainingJob, job.id)
+        updated = self._reload_job(job.id)
         assert updated.status     == JobStatus.DONE
         assert updated.model_id   == 42
         assert updated.started_at  is not None
@@ -174,12 +166,11 @@ class TestRunTrainingJobStateMachine:
     def test_failed_run_sets_failed_status(self, db):
         cfg, job = self._create_queued_job(db, "run-fail")
 
-        with patch("app.modules.job_runner.fetch_historical_data",
+        with patch("app.modules.data_collector.fetch_historical_data",
                    side_effect=RuntimeError("Prometheus unavailable")):
             job_runner._run_training_job(job.id)
 
-        db.expire_all()
-        updated = db.get(TrainingJob, job.id)
+        updated = self._reload_job(job.id)
         assert updated.status == JobStatus.FAILED
         assert updated.error_message is not None
         assert "Prometheus unavailable" in updated.error_message
@@ -193,22 +184,21 @@ class TestRunTrainingJobStateMachine:
         fake_bundle = MagicMock(spec=MetricsBundle)
         fake_report = MagicMock(spec=CorrelationReport)
         fake_report.any_significant = False
+        fake_report.is_business_constant = False
 
-        with patch("app.modules.job_runner.fetch_historical_data", return_value=fake_bundle), \
-             patch("app.modules.job_runner.analyze",               return_value=fake_report):
+        with patch("app.modules.data_collector.fetch_historical_data", return_value=fake_bundle), \
+             patch("app.modules.correlation_analyzer.analyze",    return_value=fake_report):
             job_runner._run_training_job(job.id)
 
-        db.expire_all()
-        updated = db.get(TrainingJob, job.id)
+        updated = self._reload_job(job.id)
         assert updated.status == JobStatus.FAILED
         assert "correlations" in (updated.error_message or "").lower()
 
     def test_missing_job_id_is_handled_gracefully(self, db):
-        # Should not raise
         job_runner._run_training_job(999_999)
 
     def test_job_transitions_through_running_state(self, db):
-        """Verify started_at is set before training completes."""
+        
         from app.modules.data_collector import MetricsBundle
         from app.modules.correlation_analyzer import CorrelationReport
         cfg, job = self._create_queued_job(db, "run-running")
@@ -216,7 +206,6 @@ class TestRunTrainingJobStateMachine:
         started_at_during = {}
 
         def slow_analyze(bundle):
-            # Read the job status mid-execution
             db2 = job_runner.SessionLocal()
             try:
                 j = db2.get(TrainingJob, job.id)
@@ -233,10 +222,10 @@ class TestRunTrainingJobStateMachine:
         fake_model.algorithm = "gradient_boosting"
         fake_model.metrics = {"r2_cpu": 0.9}
 
-        with patch("app.modules.job_runner.fetch_historical_data",
+        with patch("app.modules.data_collector.fetch_historical_data",
                    return_value=MagicMock(spec=MetricsBundle)), \
-             patch("app.modules.job_runner.analyze", side_effect=slow_analyze), \
-             patch("app.modules.job_runner.train_model", return_value=fake_model):
+             patch("app.modules.correlation_analyzer.analyze", side_effect=slow_analyze), \
+             patch("app.modules.model_trainer.train_model",    return_value=fake_model):
             job_runner._run_training_job(job.id)
 
         assert started_at_during.get("status") == JobStatus.RUNNING
@@ -250,21 +239,20 @@ class TestRunTrainingJobStateMachine:
 
         from app.modules.data_collector import MetricsBundle
         from app.modules.correlation_analyzer import CorrelationReport
-        fake_report = MagicMock(spec=CorrelationReport); fake_report.any_significant = True
+        fake_report = MagicMock(spec=CorrelationReport)
+        fake_report.any_significant = True
+        fake_report.is_business_constant = False
 
-        with patch("app.modules.job_runner.fetch_historical_data",
+        with patch("app.modules.data_collector.fetch_historical_data",
                    return_value=MagicMock(spec=MetricsBundle)), \
-             patch("app.modules.job_runner.analyze", return_value=fake_report), \
-             patch("app.modules.job_runner.train_model", return_value=fake_model):
+             patch("app.modules.correlation_analyzer.analyze",    return_value=fake_report), \
+             patch("app.modules.model_trainer.train_model",       return_value=fake_model):
             job_runner._run_training_job(job.id)
 
-        db.expire_all()
-        updated = db.get(TrainingJob, job.id)
+        updated = self._reload_job(job.id)
         assert updated.duration_seconds is not None
         assert updated.duration_seconds >= 0.0
 
-
-# ── Executor lifecycle ────────────────────────────────────────────────────────
 
 class TestExecutorLifecycle:
     def test_start_creates_executor(self):
@@ -300,8 +288,6 @@ class TestExecutorLifecycle:
             job_runner._executor = original
 
 
-# ── API endpoint tests ────────────────────────────────────────────────────────
-
 class TestJobAPIEndpoints:
     def _submit_job(self, client, name: str) -> dict:
         cfg = client.post("/configs/", json={
@@ -309,8 +295,9 @@ class TestJobAPIEndpoints:
             "business_metric_name": "orders",
             "business_metric_formula": "orders_total",
         }).json()
-        with patch.object(job_runner, "_executor") as mock_exec:
-            mock_exec.submit = MagicMock()
+        with patch("app.modules.job_runner.submit_training_job") as mock_submit:
+            fake = MagicMock(); fake.id = 1; fake.status = "queued"
+            mock_submit.return_value = fake
             resp = client.post(
                 f"/configs/{cfg['id']}/train/",
                 json={"lookback_days": 7},
@@ -322,8 +309,9 @@ class TestJobAPIEndpoints:
             "name": "api-job-202", "host": "h", "port": 9090,
             "business_metric_name": "m", "business_metric_formula": "m_total",
         })
-        with patch.object(job_runner, "_executor") as mock_exec:
-            mock_exec.submit = MagicMock()
+        with patch("app.modules.job_runner.submit_training_job") as mock_submit:
+            fake = MagicMock(); fake.id = 99; fake.status = "queued"
+            mock_submit.return_value = fake
             r = client.post(f"/configs/{cfg_r.json()['id']}/train/",
                             json={"lookback_days": 7})
         assert r.status_code == 202
@@ -348,8 +336,9 @@ class TestJobAPIEndpoints:
             "business_metric_name": "m", "business_metric_formula": "m_total",
         })
         config_id = cfg_r.json()["id"]
-        with patch.object(job_runner, "_executor") as mock_exec:
-            mock_exec.submit = MagicMock()
+        with patch("app.modules.job_runner.submit_training_job") as mock_submit:
+            fake = MagicMock(); fake.id = 1; fake.status = "queued"
+            mock_submit.return_value = fake
             for _ in range(3):
                 client.post(f"/configs/{config_id}/train/", json={"lookback_days": 7})
 
@@ -358,7 +347,6 @@ class TestJobAPIEndpoints:
         assert len(r.json()) == 3
 
     def test_train_404_for_missing_config(self, client):
-        with patch.object(job_runner, "_executor") as mock_exec:
-            mock_exec.submit = MagicMock()
+        with patch("app.modules.job_runner.submit_training_job") as mock_submit:
             r = client.post("/configs/999999/train/", json={"lookback_days": 7})
         assert r.status_code == 404

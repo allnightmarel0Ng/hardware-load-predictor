@@ -1,23 +1,3 @@
-"""
-Module 2 — Historical Data Collector
-Fetches time-series data from Prometheus and returns it as a MetricsBundle
-ready for correlation analysis and model training.
-
-Real vs stub:
-  By default the module makes real HTTP calls to the Prometheus range API.
-  Set USE_PROMETHEUS_STUB=true in .env (or settings.use_prometheus_stub=True)
-  to fall back to synthetic sinusoidal data — useful for local dev without
-  a live Prometheus, and for the test suite (which monkeypatches
-  _query_prometheus directly).
-
-Prometheus queries used:
-  - Business metric : the PromQL formula from ForecastingConfig
-  - CPU %           : settings.prometheus_cpu_query   (node_exporter default)
-  - RAM GB          : settings.prometheus_ram_query   (node_exporter default)
-  - Network Mbps    : settings.prometheus_net_query   (node_exporter default)
-
-All four are queried against the same host:port (the server's Prometheus).
-"""
 from __future__ import annotations
 
 import logging
@@ -34,11 +14,7 @@ logger = logging.getLogger(__name__)
 Timeseries = list[dict[str, Any]]
 
 
-# ── Public data type ──────────────────────────────────────────────────────────
-
 class MetricsBundle:
-    """Container for aligned business + system time-series (five targets)."""
-
     def __init__(
         self,
         business:    Timeseries,
@@ -62,8 +38,6 @@ class MetricsBundle:
         )
 
 
-# ── Prometheus range query ────────────────────────────────────────────────────
-
 class PrometheusQueryError(RuntimeError):
     """Raised when Prometheus returns an unexpected response."""
 
@@ -76,25 +50,6 @@ def _query_prometheus(
     end: datetime,
     step_seconds: int = 60,
 ) -> Timeseries:
-    """
-    Query the Prometheus range API for a PromQL expression.
-
-    GET /api/v1/query_range
-        query = <formula>
-        start = <unix timestamp>
-        end   = <unix timestamp>
-        step  = <resolution in seconds>
-
-    Returns a list of {"timestamp": datetime, "value": float} dicts,
-    sorted ascending by timestamp.
-
-    If the formula returns multiple series (e.g. per-instance metrics),
-    values are averaged across all series at each timestamp.
-
-    Raises:
-        PrometheusQueryError  if the response is malformed or status != "success"
-        httpx.HTTPError       if the HTTP request itself fails
-    """
     url = f"http://{host}:{port}/api/v1/query_range"
     params = {
         "query": formula,
@@ -159,8 +114,6 @@ def _query_prometheus(
     return timeseries
 
 
-# ── Stub fallback (synthetic data) ───────────────────────────────────────────
-
 def _query_prometheus_stub(
     host: str,
     port: int,
@@ -169,10 +122,6 @@ def _query_prometheus_stub(
     end: datetime,
     step_seconds: int = 60,
 ) -> Timeseries:
-    """
-    Synthetic stub — daily sinusoidal pattern + deterministic noise.
-    Used when USE_PROMETHEUS_STUB=true or when monkeypatched in tests.
-    """
     logger.debug("Using Prometheus STUB for formula=%r", formula)
     total_steps = int((end - start).total_seconds() / step_seconds)
     result: Timeseries = []
@@ -190,10 +139,6 @@ def _generate_system_stub(
     business_series: Timeseries,
     lag_steps: int = 5,
 ) -> Timeseries:
-    """
-    Synthetic system metric correlated with business_series.
-    Only used in full stub mode.
-    """
     result: Timeseries = []
     for i, point in enumerate(business_series):
         src_idx = max(0, i - lag_steps)
@@ -204,16 +149,7 @@ def _generate_system_stub(
     return result
 
 
-# ── Series alignment ──────────────────────────────────────────────────────────
-
 def _align_series(*series_list: Timeseries) -> tuple[Timeseries, ...]:
-    """
-    Align multiple time-series to their common timestamps.
-
-    Prometheus range queries for different metrics should return identical
-    timestamps, but scrape gaps and recording rule delays can cause slight
-    mismatches.  Keeps only timestamps present in ALL series.
-    """
     if not series_list:
         return ()
 
@@ -242,8 +178,6 @@ def _align_series(*series_list: Timeseries) -> tuple[Timeseries, ...]:
     )
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
-
 def fetch_historical_data(
     host: str,
     port: int,
@@ -252,34 +186,6 @@ def fetch_historical_data(
     step_seconds: int = 60,
     instance_label: str | None = None,
 ) -> MetricsBundle:
-    """
-    Fetch aligned historical time-series for correlation analysis and training.
-
-    In production (USE_PROMETHEUS_STUB=false, the default) makes six real
-    Prometheus range queries — one for the business metric and five for
-    system metrics (CPU, RAM GB, RAM %, network, disk) using the PromQL
-    expressions from settings.  All queries target the same host:port.
-
-    If instance_label is provided, the string "INSTANCE_PLACEHOLDER" in
-    each system metric query is replaced with the given label value before
-    the query is sent.  This lets per-server queries filter by the
-    node_exporter instance label (e.g. "gateway" or "auth_service").
-
-    In stub mode (USE_PROMETHEUS_STUB=true) all series are synthetic.
-
-    Args:
-        host:             Prometheus host (from ForecastingConfig).
-        port:             Prometheus port.
-        business_formula: PromQL expression for the business metric.
-        lookback_days:    History window to fetch.
-        step_seconds:     Query resolution (default 60 s = 1-min data points).
-        instance_label:   Value to substitute for INSTANCE_PLACEHOLDER in
-                          system metric queries.  If None, queries are used
-                          as-is (works when there is only one node_exporter).
-
-    Returns:
-        MetricsBundle with six aligned Timeseries.
-    """
     end   = datetime.utcnow()
     start = end - timedelta(days=lookback_days)
 
@@ -289,7 +195,6 @@ def fetch_historical_data(
     )
 
     if settings.use_prometheus_stub:
-        # Full synthetic path — business + correlated system metrics
         business    = _query_prometheus_stub(host, port, business_formula, start, end, step_seconds)
         cpu         = _generate_system_stub(30.0,  40.0,  business)
         ram_gb      = _generate_system_stub(8.0,   8.0,   business)
@@ -298,9 +203,6 @@ def fetch_historical_data(
         disk        = _generate_system_stub(15.0,  30.0,  business)
 
     else:
-        # Real path — six separate Prometheus queries.
-        # Build the instance filter: exact match if instance_label is given,
-        # otherwise match any non-empty instance label (all node_exporters).
         if instance_label:
             instance_filter = f'instance="{instance_label}"'
         else:
